@@ -126,6 +126,21 @@ function require_post(): void {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') fail('POST required', 405);
 }
 
+// ------------------------------------------------------------ validators ---
+
+function num(mixed $v, float $min, float $max, string $what = 'value'): float {
+    if (!is_numeric($v)) fail("$what must be a number");
+    $f = (float)$v;
+    if ($f < $min || $f > $max) fail("$what out of range ($min\u{2013}$max)");
+    return $f;
+}
+
+function clean_name(mixed $s, string $what = 'name'): string {
+    $s = trim((string)$s);
+    if ($s === '' || mb_strlen($s) > 80) fail("$what must be 1\u{2013}80 characters");
+    return $s;
+}
+
 // ------------------------------------------------------------------ auth ---
 
 function auth_token(): string {
@@ -192,6 +207,40 @@ function api(string $action): never {
             require_post();
             auth_cookie('', -3600);
             json_out(['ok' => true]);
+
+        case 'foods.list':
+            $foods = db()->query(
+                'SELECT id, name, kcal_per_100g, protein_per_100g, last_grams, use_count
+                 FROM foods WHERE archived = 0 ORDER BY use_count DESC, name'
+            )->fetchAll();
+            json_out(['ok' => true, 'foods' => $foods]);
+
+        case 'food.save': {
+            require_post();
+            $b = body();
+            $name    = clean_name($b['name'] ?? '');
+            $kcal    = num($b['kcal_per_100g'] ?? null, 0, 20000, 'kcal per 100 g');
+            $protein = num($b['protein_per_100g'] ?? null, 0, 1000, 'protein per 100 g');
+            $id = $b['id'] ?? null;
+            if ($id !== null) {
+                $id = (int)num($id, 1, PHP_INT_MAX, 'id');
+                $st = db()->prepare('UPDATE foods SET name = ?, kcal_per_100g = ?, protein_per_100g = ? WHERE id = ? AND archived = 0');
+                $st->execute([$name, $kcal, $protein, $id]);
+                if ($st->rowCount() === 0) fail('food not found', 404);
+            } else {
+                db()->prepare('INSERT INTO foods (name, kcal_per_100g, protein_per_100g) VALUES (?, ?, ?)')
+                    ->execute([$name, $kcal, $protein]);
+                $id = (int)db()->lastInsertId();
+            }
+            json_out(['ok' => true, 'id' => $id]);
+        }
+
+        case 'food.delete': {
+            require_post();
+            $id = (int)num(body()['id'] ?? null, 1, PHP_INT_MAX, 'id');
+            db()->prepare('UPDATE foods SET archived = 1 WHERE id = ?')->execute([$id]);
+            json_out(['ok' => true]);
+        }
 
         default:
             fail('unknown action', 404);
