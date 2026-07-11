@@ -141,6 +141,23 @@ function clean_name(mixed $s, string $what = 'name'): string {
     return $s;
 }
 
+function valid_day(mixed $s): string {
+    $s = (string)$s;
+    if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $s, $m) && checkdate((int)$m[2], (int)$m[3], (int)$m[1])) {
+        return $s;
+    }
+    fail('invalid date');
+}
+
+function get_targets(): array {
+    $rows = db()->query("SELECT key, value FROM settings WHERE key IN ('kcal_target','protein_target')")
+                ->fetchAll(PDO::FETCH_KEY_PAIR);
+    return [
+        'kcal'    => (float)($rows['kcal_target'] ?? 2200),
+        'protein' => (float)($rows['protein_target'] ?? 160),
+    ];
+}
+
 // ----------------------------------------------------------------- meals ---
 
 /** @return array{kcal: float, protein: float} */
@@ -335,6 +352,168 @@ function api(string $action): never {
             $id = (int)num(body()['id'] ?? null, 1, PHP_INT_MAX, 'id');
             db()->prepare('UPDATE meals SET archived = 1 WHERE id = ?')->execute([$id]);
             json_out(['ok' => true]);
+        }
+
+        case 'entry.add': {
+            require_post();
+            $b = body();
+            $day  = valid_day($b['day'] ?? today());
+            $type = (string)($b['type'] ?? 'quick');
+            $db = db();
+            switch ($type) {
+                case 'quick':
+                    $kcal    = num($b['kcal'] ?? null, 0, 20000, 'kcal');
+                    $protein = num($b['protein'] ?? 0, 0, 1000, 'protein');
+                    $label   = trim((string)($b['label'] ?? ''));
+                    $label   = $label === '' ? 'Quick add' : clean_name($label, 'label');
+                    break;
+                case 'food':
+                    $foodId = (int)num($b['food_id'] ?? null, 1, PHP_INT_MAX, 'food_id');
+                    $grams  = num($b['grams'] ?? null, 0.1, 5000, 'grams');
+                    $st = $db->prepare('SELECT * FROM foods WHERE id = ? AND archived = 0');
+                    $st->execute([$foodId]);
+                    $food = $st->fetch();
+                    if (!$food) fail('food not found', 404);
+                    $kcal    = round($food['kcal_per_100g'] * $grams / 100.0, 1);
+                    $protein = round($food['protein_per_100g'] * $grams / 100.0, 1);
+                    $label   = $food['name'] . ' ' . rtrim(rtrim(number_format($grams, 1, '.', ''), '0'), '.') . ' g';
+                    $db->prepare('UPDATE foods SET use_count = use_count + 1, last_grams = ? WHERE id = ?')
+                       ->execute([$grams, $foodId]);
+                    break;
+                case 'meal':
+                    $mealId = (int)num($b['meal_id'] ?? null, 1, PHP_INT_MAX, 'meal_id');
+                    $st = $db->prepare('SELECT * FROM meals WHERE id = ? AND archived = 0');
+                    $st->execute([$mealId]);
+                    $meal = $st->fetch();
+                    if (!$meal) fail('meal not found', 404);
+                    $t = meal_totals($mealId);
+                    $kcal    = $t['kcal'];
+                    $protein = $t['protein'];
+                    $label   = $meal['name'];
+                    $db->prepare('UPDATE meals SET use_count = use_count + 1 WHERE id = ?')->execute([$mealId]);
+                    break;
+                default:
+                    fail('unknown entry type');
+            }
+            $db->prepare('INSERT INTO entries (day, label, kcal, protein, source) VALUES (?, ?, ?, ?, ?)')
+               ->execute([$day, $label, $kcal, $protein, $type]);
+            json_out(['ok' => true, 'entry' => [
+                'id' => (int)$db->lastInsertId(), 'day' => $day, 'label' => $label,
+                'kcal' => $kcal, 'protein' => $protein, 'source' => $type,
+            ]]);
+        }
+
+        case 'entry.delete': {
+            require_post();
+            $id = (int)num(body()['id'] ?? null, 1, PHP_INT_MAX, 'id');
+            db()->prepare('DELETE FROM entries WHERE id = ?')->execute([$id]);
+            json_out(['ok' => true]);
+        }
+
+        case 'weight.set': {
+            require_post();
+            $b = body();
+            $day = valid_day($b['day'] ?? today());
+            $kg  = $b['kg'] ?? null;
+            if ($kg === null || $kg === '') {
+                db()->prepare('DELETE FROM weights WHERE day = ?')->execute([$day]);
+                json_out(['ok' => true, 'kg' => null]);
+            }
+            $kg = num($kg, 20, 400, 'weight');
+            db()->prepare('INSERT INTO weights (day, kg) VALUES (?, ?)
+                           ON CONFLICT(day) DO UPDATE SET kg = excluded.kg')->execute([$day, $kg]);
+            json_out(['ok' => true, 'kg' => $kg]);
+        }
+
+        case 'targets.set': {
+            require_post();
+            $b = body();
+            $kcal    = num($b['kcal_target'] ?? null, 500, 20000, 'kcal target');
+            $protein = num($b['protein_target'] ?? null, 10, 1000, 'protein target');
+            $st = db()->prepare('INSERT INTO settings (key, value) VALUES (?, ?)
+                                 ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+            $st->execute(['kcal_target', $kcal]);
+            $st->execute(['protein_target', $protein]);
+            json_out(['ok' => true]);
+        }
+
+        case 'day': {
+            $date = valid_day($_GET['date'] ?? today());
+            $db = db();
+            $st = $db->prepare('SELECT id, label, kcal, protein, source FROM entries
+                                WHERE day = ? ORDER BY id DESC');
+            $st->execute([$date]);
+            $entries = $st->fetchAll();
+            $totals = ['kcal' => 0.0, 'protein' => 0.0];
+            foreach ($entries as $e) {
+                $totals['kcal']    += $e['kcal'];
+                $totals['protein'] += $e['protein'];
+            }
+            $totals['kcal']    = round($totals['kcal'], 1);
+            $totals['protein'] = round($totals['protein'], 1);
+            $st = $db->prepare('SELECT kg FROM weights WHERE day = ?');
+            $st->execute([$date]);
+            $weight = $st->fetchColumn();
+            $st = $db->prepare('SELECT kg FROM weights WHERE day < ? ORDER BY day DESC LIMIT 1');
+            $st->execute([$date]);
+            $prev = $st->fetchColumn();
+            json_out([
+                'ok' => true, 'date' => $date, 'today' => today(),
+                'entries' => $entries,
+                'weight' => $weight === false ? null : (float)$weight,
+                'prev_weight' => $prev === false ? null : (float)$prev,
+                'totals' => $totals,
+                'targets' => get_targets(),
+            ]);
+        }
+
+        case 'trend': {
+            $n = (int)num($_GET['days'] ?? 30, 1, 365, 'days');
+            $db = db();
+            $end = new DateTimeImmutable(today());
+            $days = [];
+            $kcalRows = $db->prepare('SELECT day, ROUND(SUM(kcal),1) AS kcal, ROUND(SUM(protein),1) AS protein
+                                      FROM entries WHERE day >= ? GROUP BY day');
+            $start = $end->modify('-' . ($n - 1) . ' days')->format('Y-m-d');
+            $kcalRows->execute([$start]);
+            $byDay = [];
+            foreach ($kcalRows->fetchAll() as $r) $byDay[$r['day']] = $r;
+            $wRows = $db->prepare('SELECT day, kg FROM weights WHERE day >= ?');
+            $wRows->execute([$start]);
+            $wByDay = $wRows->fetchAll(PDO::FETCH_KEY_PAIR);
+            for ($i = $n - 1; $i >= 0; $i--) {
+                $d = $end->modify("-$i days")->format('Y-m-d');
+                $days[] = [
+                    'day'     => $d,
+                    'kcal'    => (float)($byDay[$d]['kcal'] ?? 0),
+                    'protein' => (float)($byDay[$d]['protein'] ?? 0),
+                    'weight'  => isset($wByDay[$d]) ? (float)$wByDay[$d] : null,
+                ];
+            }
+            json_out(['ok' => true, 'days' => $days, 'targets' => get_targets()]);
+        }
+
+        case 'selftest': {
+            $tables = db()->query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                          ->fetchAll(PDO::FETCH_COLUMN);
+            $expected = ['settings', 'foods', 'meals', 'meal_items', 'entries', 'weights', 'steps'];
+            $missing = array_values(array_diff($expected, $tables));
+            $db = db();
+            $db->beginTransaction();
+            try {
+                $db->exec("INSERT INTO foods (name, kcal_per_100g, protein_per_100g) VALUES ('__selftest__', 200, 10)");
+                $fid = (int)$db->lastInsertId();
+                $db->exec("INSERT INTO meals (name) VALUES ('__selftest__')");
+                $mid = (int)$db->lastInsertId();
+                $db->prepare('INSERT INTO meal_items (meal_id, food_id, grams) VALUES (?, ?, 50)')->execute([$mid, $fid]);
+                $db->prepare('INSERT INTO meal_items (meal_id, raw_kcal, raw_protein) VALUES (?, 25, 3)')->execute([$mid]);
+                $t = meal_totals($mid);
+                $mathOk = abs($t['kcal'] - 125) < 0.01 && abs($t['protein'] - 8) < 0.01;
+            } finally {
+                $db->rollBack();
+            }
+            $pass = $missing === [] && $mathOk;
+            json_out(['ok' => true, 'pass' => $pass, 'missing_tables' => $missing, 'meal_math' => $mathOk]);
         }
 
         default:
