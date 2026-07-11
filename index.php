@@ -616,7 +616,14 @@ function asset(string $name): never {
               if (url.origin !== location.origin) return;
               if (url.searchParams.has('api')) return; // data is network-only
               if (e.request.mode === 'navigate') {
-                e.respondWith(caches.match('index.php').then((r) => r || fetch(e.request)));
+                // Network-first so login/logout state is always fresh; cache is the offline fallback.
+                e.respondWith(fetch(e.request).then((resp) => {
+                  if (resp.ok) {
+                    const copy = resp.clone();
+                    caches.open(CACHE).then((c) => c.put('index.php', copy));
+                  }
+                  return resp;
+                }).catch(() => caches.match('index.php')));
                 return;
               }
               e.respondWith(caches.match(e.request, { ignoreVary: true }).then((r) =>
@@ -1124,6 +1131,7 @@ const App = {
       this.toast('offline, not saved');
       throw new Error('offline');
     }
+    if (r.status === 401) { location.reload(); throw new Error('unauthorized'); }
     const d = await r.json();
     if (!d.ok) { this.toast(d.error || 'error'); throw new Error(d.error); }
     return d;
