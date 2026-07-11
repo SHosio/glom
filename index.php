@@ -731,6 +731,59 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 .pick .zero { color: var(--ink-soft); font-weight: 600; }
 .preview { margin-top: 8px; color: var(--ink-soft); font-weight: 700; text-align: center; min-height: 1.3em; }
 .preview b { color: var(--ink); }
+
+/* ---------- panels (manager + settings) ---------- */
+.overlay {
+  position: fixed; inset: 0; background: rgba(20,30,24,.45); z-index: 60;
+  opacity: 0; pointer-events: none; transition: opacity .25s;
+}
+.overlay.open { opacity: 1; pointer-events: auto; }
+.panel {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 92vw); z-index: 61;
+  background: var(--bg); box-shadow: -8px 0 32px rgba(0,0,0,.18);
+  transform: translateX(105%); transition: transform .3s cubic-bezier(.22,1,.36,1);
+  overflow-y: auto; padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+}
+.panel.open { transform: none; }
+.panel h2 { font-size: 1.3rem; font-weight: 800; margin-bottom: 4px; }
+.panel .close { position: absolute; top: 12px; right: 12px; font-size: 1.4rem; padding: 6px 12px; color: var(--ink-soft); }
+.panel .tabs { margin-top: 12px; }
+.mgr-list { margin-top: 12px; }
+.mgr-item {
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 12px 14px; margin-bottom: 8px; box-shadow: var(--shadow);
+}
+.mgr-item .head { display: flex; align-items: baseline; gap: 8px; }
+.mgr-item .head .nm { font-weight: 700; flex: 1; }
+.mgr-item .head .k { color: var(--ink-soft); font-size: .9rem; font-weight: 600; white-space: nowrap; }
+.mgr-item .acts { display: flex; gap: 12px; margin-top: 6px; }
+.mgr-item .acts button { color: var(--green-deep); font-weight: 700; font-size: .9rem; }
+.mgr-item .acts button.danger { color: var(--red); }
+.mgr-form {
+  background: var(--card); border: 1.5px dashed var(--line); border-radius: 14px;
+  padding: 12px; margin-top: 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.mgr-form .row { display: flex; gap: 8px; }
+.mgr-form input {
+  min-width: 0; border: 1.5px solid var(--line); border-radius: 10px; padding: 9px 10px;
+  background: var(--bg); outline: none; font-weight: 600; flex: 1;
+}
+.mgr-form input:focus { border-color: var(--green); }
+.mgr-form .hint { color: var(--ink-soft); font-size: .82rem; font-weight: 600; }
+.mgr-form .itemrow { display: flex; gap: 6px; align-items: center; }
+.mgr-form .itemrow .rm { color: var(--red); font-weight: 800; padding: 4px 8px; }
+.mgr-form .switch { color: var(--green-deep); font-weight: 700; font-size: .85rem; text-align: left; }
+.mgr-form .total { font-weight: 800; text-align: right; }
+.btnrow { display: flex; gap: 8px; margin-top: 4px; }
+.btn-primary { background: var(--green); color: #fff; font-weight: 800; border-radius: 10px; padding: 10px 18px; flex: 1; }
+.btn-ghost { color: var(--ink-soft); font-weight: 700; padding: 10px 14px; }
+.settings-row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.settings-row label { flex: 1; font-weight: 700; }
+.settings-row input {
+  width: 100px; border: 1.5px solid var(--line); border-radius: 10px; padding: 9px 10px;
+  background: var(--card); outline: none; font-weight: 700; text-align: right;
+}
+.logout { margin-top: 28px; color: var(--red); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -837,6 +890,64 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
         </div>
       </div>
     </div>
+  </div>
+
+  <div class="overlay" id="overlay"></div>
+
+  <div class="panel" id="bookPanel">
+    <button class="close" data-close>&#10005;</button>
+    <h2>Favourites</h2>
+    <div class="tabs">
+      <button id="mtabFoods" class="on">Foods</button>
+      <button id="mtabMeals">Meals</button>
+    </div>
+    <div id="mgrFoods">
+      <div class="mgr-list" id="mgrFoodList"></div>
+      <form class="mgr-form" id="foodForm">
+        <input type="hidden" id="ffId">
+        <input id="ffName" type="text" maxlength="80" placeholder="Food name" required>
+        <div class="row">
+          <input id="ffKcal" type="number" inputmode="decimal" min="0" step="0.1" placeholder="kcal / 100 g" required>
+          <input id="ffProtein" type="number" inputmode="decimal" min="0" step="0.1" placeholder="protein g / 100 g" required>
+        </div>
+        <div class="btnrow">
+          <button class="btn-primary" type="submit" id="ffSave">Add food</button>
+          <button class="btn-ghost" type="button" id="ffCancel" hidden>Cancel</button>
+        </div>
+      </form>
+    </div>
+    <div id="mgrMeals" hidden>
+      <div class="mgr-list" id="mgrMealList"></div>
+      <form class="mgr-form" id="mealForm">
+        <input type="hidden" id="mfId">
+        <input id="mfName" type="text" maxlength="80" placeholder="Meal name (e.g. glob)" required>
+        <div id="mfItems"></div>
+        <button class="switch" type="button" id="mfAddFoodItem">+ favourite food</button>
+        <button class="switch" type="button" id="mfAddRawItem">+ raw kcal / protein</button>
+        <div class="total" id="mfTotal"></div>
+        <div class="btnrow">
+          <button class="btn-primary" type="submit" id="mfSave">Add meal</button>
+          <button class="btn-ghost" type="button" id="mfCancel" hidden>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="panel" id="gearPanel">
+    <button class="close" data-close>&#10005;</button>
+    <h2>Settings</h2>
+    <div class="settings-row">
+      <label for="setKcal">Daily kcal target</label>
+      <input id="setKcal" type="number" inputmode="numeric" min="500" max="20000">
+    </div>
+    <div class="settings-row">
+      <label for="setProtein">Daily protein target (g)</label>
+      <input id="setProtein" type="number" inputmode="numeric" min="10" max="1000">
+    </div>
+    <div class="btnrow" style="margin-top:16px">
+      <button class="btn-primary" id="setSave">Save targets</button>
+    </div>
+    <button class="logout" id="logoutBtn">Log out</button>
   </div>
 </div>
 <script>
@@ -1093,12 +1204,200 @@ const App = {
   },
 
   setTab(id) {
-    for (const t of document.querySelectorAll('.tabs button')) {
+    for (const t of document.querySelectorAll('#addbar .tabs button')) {
       const on = t.id === id;
       t.classList.toggle('on', on);
       document.getElementById(t.dataset.pane).hidden = !on;
     }
     localStorage.setItem('glom_tab', id);
+  },
+
+  // ---------- manager panel ----------
+
+  openPanel(id) {
+    document.getElementById('overlay').classList.add('open');
+    document.getElementById(id).classList.add('open');
+    if (id === 'bookPanel') this.renderMgr();
+    if (id === 'gearPanel') {
+      document.getElementById('setKcal').value = this.state.day?.targets.kcal ?? '';
+      document.getElementById('setProtein').value = this.state.day?.targets.protein ?? '';
+    }
+  },
+
+  closePanels() {
+    document.getElementById('overlay').classList.remove('open');
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('open'));
+  },
+
+  renderMgr() {
+    const foods = document.getElementById('mgrFoodList');
+    foods.innerHTML = '';
+    for (const f of this.state.foods) {
+      foods.appendChild(this.mgrItem(
+        f.name,
+        this.fmt(f.kcal_per_100g) + ' kcal · ' + this.fmt(f.protein_per_100g) + ' g / 100 g',
+        () => {
+          document.getElementById('ffId').value = f.id;
+          document.getElementById('ffName').value = f.name;
+          document.getElementById('ffKcal').value = f.kcal_per_100g;
+          document.getElementById('ffProtein').value = f.protein_per_100g;
+          document.getElementById('ffSave').textContent = 'Save food';
+          document.getElementById('ffCancel').hidden = false;
+        },
+        async () => {
+          if (!confirm('Remove "' + f.name + '" from favourites? Logged history keeps its numbers.')) return;
+          await this.api('food.delete', { id: f.id });
+          await this.loadFavs();
+          this.renderMgr();
+        }
+      ));
+    }
+    const meals = document.getElementById('mgrMealList');
+    meals.innerHTML = '';
+    for (const m of this.state.meals) {
+      meals.appendChild(this.mgrItem(
+        m.name,
+        this.fmt(m.kcal) + ' kcal · ' + this.fmt(m.protein) + ' g',
+        () => this.editMeal(m),
+        async () => {
+          if (!confirm('Remove meal "' + m.name + '"? Logged history keeps its numbers.')) return;
+          await this.api('meal.delete', { id: m.id });
+          await this.loadFavs();
+          this.renderMgr();
+        }
+      ));
+    }
+  },
+
+  mgrItem(name, sub, onEdit, onDelete) {
+    const d = document.createElement('div');
+    d.className = 'mgr-item';
+    const head = document.createElement('div');
+    head.className = 'head';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = name;
+    const k = document.createElement('span');
+    k.className = 'k';
+    k.textContent = sub;
+    head.append(nm, k);
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+    const eb = document.createElement('button');
+    eb.textContent = 'Edit';
+    eb.addEventListener('click', onEdit);
+    const db = document.createElement('button');
+    db.className = 'danger';
+    db.textContent = 'Remove';
+    db.addEventListener('click', onDelete);
+    acts.append(eb, db);
+    d.append(head, acts);
+    return d;
+  },
+
+  // ---------- meal editor ----------
+
+  mealItemRow(kind, preset) {
+    const row = document.createElement('div');
+    row.className = 'itemrow';
+    row.dataset.kind = kind;
+    if (kind === 'food') {
+      const sel = document.createElement('select');
+      sel.style.cssText = 'flex:2;min-width:0;padding:9px 6px;border:1.5px solid var(--line);border-radius:10px;background:var(--bg);font-weight:600;color:inherit';
+      for (const f of this.state.foods) {
+        const o = document.createElement('option');
+        o.value = f.id;
+        o.textContent = f.name;
+        sel.appendChild(o);
+      }
+      if (preset?.food_id) sel.value = preset.food_id;
+      const g = document.createElement('input');
+      g.type = 'number'; g.min = '1'; g.max = '5000'; g.placeholder = 'g';
+      g.style.flex = '1';
+      g.value = preset?.grams ?? '';
+      sel.addEventListener('change', () => this.mealFormTotal());
+      g.addEventListener('input', () => this.mealFormTotal());
+      row.append(sel, g);
+    } else {
+      const lbl = document.createElement('input');
+      lbl.type = 'text'; lbl.maxLength = 80; lbl.placeholder = 'label';
+      lbl.style.flex = '2';
+      lbl.value = preset?.raw_label ?? '';
+      const k = document.createElement('input');
+      k.type = 'number'; k.min = '0'; k.placeholder = 'kcal';
+      k.style.flex = '1';
+      k.value = preset?.raw_kcal ?? '';
+      const p = document.createElement('input');
+      p.type = 'number'; p.min = '0'; p.placeholder = 'prot g';
+      p.style.flex = '1';
+      p.value = preset?.raw_protein ?? '';
+      k.addEventListener('input', () => this.mealFormTotal());
+      p.addEventListener('input', () => this.mealFormTotal());
+      row.append(lbl, k, p);
+    }
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'rm';
+    rm.textContent = '✕';
+    rm.addEventListener('click', () => { row.remove(); this.mealFormTotal(); });
+    row.appendChild(rm);
+    document.getElementById('mfItems').appendChild(row);
+    this.mealFormTotal();
+  },
+
+  mealFormItems() {
+    const items = [];
+    for (const row of document.querySelectorAll('#mfItems .itemrow')) {
+      if (row.dataset.kind === 'food') {
+        const [sel, g] = row.querySelectorAll('select, input');
+        if (sel.value && parseFloat(g.value) > 0) items.push({ food_id: +sel.value, grams: +g.value });
+      } else {
+        const [lbl, k, p] = row.querySelectorAll('input');
+        if (k.value !== '' || p.value !== '') {
+          items.push({ raw_label: lbl.value, raw_kcal: +k.value || 0, raw_protein: +p.value || 0 });
+        }
+      }
+    }
+    return items;
+  },
+
+  mealFormTotal() {
+    let kcal = 0, protein = 0;
+    for (const it of this.mealFormItems()) {
+      if (it.food_id) {
+        const f = this.state.foods.find(f => f.id === it.food_id);
+        if (f) { kcal += f.kcal_per_100g * it.grams / 100; protein += f.protein_per_100g * it.grams / 100; }
+      } else {
+        kcal += it.raw_kcal; protein += it.raw_protein;
+      }
+    }
+    document.getElementById('mfTotal').textContent =
+      this.fmt(Math.round(kcal * 10) / 10) + ' kcal · ' + this.fmt(Math.round(protein * 10) / 10) + ' g protein';
+  },
+
+  editMeal(m) {
+    document.getElementById('mfId').value = m.id;
+    document.getElementById('mfName').value = m.name;
+    document.getElementById('mfItems').innerHTML = '';
+    for (const it of m.items) this.mealItemRow(it.food_id ? 'food' : 'raw', it);
+    document.getElementById('mfSave').textContent = 'Save meal';
+    document.getElementById('mfCancel').hidden = false;
+  },
+
+  resetFoodForm() {
+    document.getElementById('foodForm').reset();
+    document.getElementById('ffId').value = '';
+    document.getElementById('ffSave').textContent = 'Add food';
+    document.getElementById('ffCancel').hidden = true;
+  },
+
+  resetMealForm() {
+    document.getElementById('mealForm').reset();
+    document.getElementById('mfId').value = '';
+    document.getElementById('mfItems').innerHTML = '';
+    document.getElementById('mfTotal').textContent = '';
+    document.getElementById('mfSave').textContent = 'Add meal';
+    document.getElementById('mfCancel').hidden = true;
   },
 };
 
@@ -1138,6 +1437,70 @@ document.getElementById('quickAdd').addEventListener('click', async () => {
     label: document.getElementById('quickLabel').value,
   });
   for (const id of ['quickKcal', 'quickProtein', 'quickLabel']) document.getElementById(id).value = '';
+});
+
+document.getElementById('openBook').addEventListener('click', () => App.openPanel('bookPanel'));
+document.getElementById('openGear').addEventListener('click', () => App.openPanel('gearPanel'));
+document.getElementById('overlay').addEventListener('click', () => App.closePanels());
+document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => App.closePanels()));
+
+document.getElementById('mtabFoods').addEventListener('click', () => {
+  document.getElementById('mtabFoods').classList.add('on');
+  document.getElementById('mtabMeals').classList.remove('on');
+  document.getElementById('mgrFoods').hidden = false;
+  document.getElementById('mgrMeals').hidden = true;
+});
+document.getElementById('mtabMeals').addEventListener('click', () => {
+  document.getElementById('mtabMeals').classList.add('on');
+  document.getElementById('mtabFoods').classList.remove('on');
+  document.getElementById('mgrMeals').hidden = false;
+  document.getElementById('mgrFoods').hidden = true;
+});
+
+document.getElementById('foodForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id = document.getElementById('ffId').value;
+  await App.api('food.save', {
+    id: id ? +id : undefined,
+    name: document.getElementById('ffName').value,
+    kcal_per_100g: +document.getElementById('ffKcal').value,
+    protein_per_100g: +document.getElementById('ffProtein').value,
+  });
+  App.resetFoodForm();
+  await App.loadFavs();
+  App.renderMgr();
+});
+document.getElementById('ffCancel').addEventListener('click', () => App.resetFoodForm());
+
+document.getElementById('mfAddFoodItem').addEventListener('click', () => App.mealItemRow('food'));
+document.getElementById('mfAddRawItem').addEventListener('click', () => App.mealItemRow('raw'));
+document.getElementById('mealForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const items = App.mealFormItems();
+  if (!items.length) { App.toast('a meal needs at least one item'); return; }
+  const id = document.getElementById('mfId').value;
+  await App.api('meal.save', {
+    id: id ? +id : undefined,
+    name: document.getElementById('mfName').value,
+    items,
+  });
+  App.resetMealForm();
+  await App.loadFavs();
+  App.renderMgr();
+});
+document.getElementById('mfCancel').addEventListener('click', () => App.resetMealForm());
+
+document.getElementById('setSave').addEventListener('click', async () => {
+  await App.api('targets.set', {
+    kcal_target: +document.getElementById('setKcal').value,
+    protein_target: +document.getElementById('setProtein').value,
+  });
+  App.closePanels();
+  App.load(App.state.date);
+});
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await App.api('logout', {});
+  location.reload();
 });
 
 App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
