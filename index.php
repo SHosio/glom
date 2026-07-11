@@ -126,6 +126,30 @@ function require_post(): void {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') fail('POST required', 405);
 }
 
+// ------------------------------------------------------------------ auth ---
+
+function auth_token(): string {
+    return hash_hmac('sha256', 'glom-auth-v1', GLOM_SECRET);
+}
+
+function auth_ok(): bool {
+    return hash_equals(auth_token(), $_COOKIE['glom_auth'] ?? '');
+}
+
+function require_auth(): void {
+    if (!auth_ok()) fail('unauthorized', 401);
+}
+
+function auth_cookie(string $value, int $maxAge): void {
+    setcookie('glom_auth', $value, [
+        'expires'  => time() + $maxAge,
+        'path'     => '/',
+        'secure'   => !empty($_SERVER['HTTPS']),
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
 // ---------------------------------------------------------------- router ---
 
 $api   = $_GET['api']   ?? null;
@@ -149,9 +173,26 @@ exit;
 // ------------------------------------------------------------------- api ---
 
 function api(string $action): never {
+    if (!in_array($action, ['ping', 'login'], true)) require_auth();
     switch ($action) {
         case 'ping':
             json_out(['ok' => true, 'pong' => true]);
+
+        case 'login':
+            require_post();
+            $pin = (string)(body()['pin'] ?? '');
+            if (!hash_equals(GLOM_PIN, $pin)) {
+                sleep(2);
+                fail('wrong PIN', 401);
+            }
+            auth_cookie(auth_token(), 400 * 86400);
+            json_out(['ok' => true]);
+
+        case 'logout':
+            require_post();
+            auth_cookie('', -3600);
+            json_out(['ok' => true]);
+
         default:
             fail('unknown action', 404);
     }
