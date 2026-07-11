@@ -141,6 +141,22 @@ function clean_name(mixed $s, string $what = 'name'): string {
     return $s;
 }
 
+// ----------------------------------------------------------------- meals ---
+
+/** @return array{kcal: float, protein: float} */
+function meal_totals(int $mealId): array {
+    $row = db()->prepare(
+        'SELECT
+            COALESCE(SUM(COALESCE(mi.raw_kcal, 0) + COALESCE(f.kcal_per_100g * mi.grams / 100.0, 0)), 0) AS kcal,
+            COALESCE(SUM(COALESCE(mi.raw_protein, 0) + COALESCE(f.protein_per_100g * mi.grams / 100.0, 0)), 0) AS protein
+         FROM meal_items mi LEFT JOIN foods f ON f.id = mi.food_id
+         WHERE mi.meal_id = ?'
+    );
+    $row->execute([$mealId]);
+    $t = $row->fetch();
+    return ['kcal' => round((float)$t['kcal'], 1), 'protein' => round((float)$t['protein'], 1)];
+}
+
 // ------------------------------------------------------------------ auth ---
 
 function auth_token(): string {
@@ -239,6 +255,85 @@ function api(string $action): never {
             require_post();
             $id = (int)num(body()['id'] ?? null, 1, PHP_INT_MAX, 'id');
             db()->prepare('UPDATE foods SET archived = 1 WHERE id = ?')->execute([$id]);
+            json_out(['ok' => true]);
+        }
+
+        case 'meals.list': {
+            $meals = db()->query(
+                'SELECT id, name, use_count FROM meals WHERE archived = 0 ORDER BY use_count DESC, name'
+            )->fetchAll();
+            $itemsStmt = db()->prepare(
+                'SELECT mi.id, mi.food_id, f.name AS food_name, mi.grams, mi.raw_label, mi.raw_kcal, mi.raw_protein
+                 FROM meal_items mi LEFT JOIN foods f ON f.id = mi.food_id
+                 WHERE mi.meal_id = ? ORDER BY mi.id'
+            );
+            foreach ($meals as &$m) {
+                $itemsStmt->execute([$m['id']]);
+                $m['items'] = $itemsStmt->fetchAll();
+                $m += meal_totals((int)$m['id']);
+            }
+            json_out(['ok' => true, 'meals' => $meals]);
+        }
+
+        case 'meal.save': {
+            require_post();
+            $b = body();
+            $name  = clean_name($b['name'] ?? '');
+            $items = $b['items'] ?? null;
+            if (!is_array($items) || $items === []) fail('a meal needs at least one item');
+            $parsed = [];
+            foreach ($items as $it) {
+                if (!is_array($it)) fail('invalid meal item');
+                if (isset($it['food_id'])) {
+                    $foodId = (int)num($it['food_id'], 1, PHP_INT_MAX, 'food_id');
+                    $grams  = num($it['grams'] ?? null, 0.1, 5000, 'grams');
+                    $parsed[] = ['food_id' => $foodId, 'grams' => $grams,
+                                 'raw_label' => null, 'raw_kcal' => null, 'raw_protein' => null];
+                } elseif (isset($it['raw_kcal']) || isset($it['raw_protein'])) {
+                    $parsed[] = [
+                        'food_id' => null, 'grams' => null,
+                        'raw_label'   => isset($it['raw_label']) && trim((string)$it['raw_label']) !== ''
+                                         ? clean_name($it['raw_label'], 'item label') : null,
+                        'raw_kcal'    => num($it['raw_kcal'] ?? 0, 0, 20000, 'item kcal'),
+                        'raw_protein' => num($it['raw_protein'] ?? 0, 0, 1000, 'item protein'),
+                    ];
+                } else {
+                    fail('invalid meal item');
+                }
+            }
+            $db = db();
+            $db->beginTransaction();
+            try {
+                $id = $b['id'] ?? null;
+                if ($id !== null) {
+                    $id = (int)num($id, 1, PHP_INT_MAX, 'id');
+                    $st = $db->prepare('UPDATE meals SET name = ? WHERE id = ? AND archived = 0');
+                    $st->execute([$name, $id]);
+                    if ($st->rowCount() === 0) fail('meal not found', 404);
+                    $db->prepare('DELETE FROM meal_items WHERE meal_id = ?')->execute([$id]);
+                } else {
+                    $db->prepare('INSERT INTO meals (name) VALUES (?)')->execute([$name]);
+                    $id = (int)$db->lastInsertId();
+                }
+                $ins = $db->prepare(
+                    'INSERT INTO meal_items (meal_id, food_id, grams, raw_label, raw_kcal, raw_protein)
+                     VALUES (?, ?, ?, ?, ?, ?)'
+                );
+                foreach ($parsed as $p) {
+                    $ins->execute([$id, $p['food_id'], $p['grams'], $p['raw_label'], $p['raw_kcal'], $p['raw_protein']]);
+                }
+                $db->commit();
+            } catch (Throwable $e) {
+                $db->rollBack();
+                throw $e;
+            }
+            json_out(['ok' => true, 'id' => $id] + meal_totals($id));
+        }
+
+        case 'meal.delete': {
+            require_post();
+            $id = (int)num(body()['id'] ?? null, 1, PHP_INT_MAX, 'id');
+            db()->prepare('UPDATE meals SET archived = 1 WHERE id = ?')->execute([$id]);
             json_out(['ok' => true]);
         }
 
