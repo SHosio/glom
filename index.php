@@ -680,6 +680,57 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
   font-weight: 700; opacity: 0; pointer-events: none; transition: all .3s; z-index: 50;
 }
 .toast.show { opacity: 1; transform: translateX(-50%); }
+
+/* ---------- favourites strip + add bar ---------- */
+#addbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  background: var(--card); border-top: 1px solid var(--line);
+  box-shadow: 0 -6px 24px rgba(34,51,43,.08);
+  padding: 0 0 env(safe-area-inset-bottom);
+}
+#addbar .inner { max-width: 480px; margin: 0 auto; padding: 8px 16px 10px; }
+#chips {
+  display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+#chips::-webkit-scrollbar { display: none; }
+.chip {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  border: 1.5px solid var(--line); border-radius: 999px; padding: 7px 14px;
+  font-weight: 700; font-size: .95rem; background: var(--bg); white-space: nowrap;
+}
+.chip:active { transform: scale(.96); }
+.chip.meal { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+.chip .k { color: var(--ink-soft); font-weight: 600; font-size: .85rem; }
+.tabs { display: flex; gap: 4px; background: var(--track); border-radius: 14px; padding: 4px; }
+.tabs button {
+  flex: 1; padding: 8px 0; border-radius: 10px; font-weight: 700; color: var(--ink-soft);
+}
+.tabs button.on { background: var(--card); color: var(--ink); box-shadow: var(--shadow); }
+.pane { padding-top: 10px; }
+.pane[hidden] { display: none; }
+.pane .row { display: flex; gap: 8px; }
+.pane input {
+  min-width: 0; border: 1.5px solid var(--line); border-radius: 12px; padding: 10px 12px;
+  background: var(--bg); outline: none; font-weight: 600;
+}
+.pane input:focus { border-color: var(--green); }
+.pane .grow { flex: 1; }
+.addbtn {
+  background: var(--green); color: #fff; font-weight: 800; border-radius: 12px;
+  padding: 10px 20px; flex: 0 0 auto;
+}
+.addbtn:disabled { opacity: .4; }
+.picklist { max-height: 34dvh; overflow-y: auto; margin-top: 8px; }
+.pick {
+  display: flex; align-items: baseline; gap: 8px; width: 100%; text-align: left;
+  padding: 10px 8px; border-radius: 10px; font-weight: 700;
+}
+.pick:active, .pick.sel { background: var(--track); }
+.pick .k { margin-left: auto; color: var(--ink-soft); font-weight: 600; font-size: .9rem; white-space: nowrap; }
+.pick .zero { color: var(--ink-soft); font-weight: 600; }
+.preview { margin-top: 8px; color: var(--ink-soft); font-weight: 700; text-align: center; min-height: 1.3em; }
+.preview b { color: var(--ink); }
 </style>
 </head>
 <body>
@@ -756,10 +807,41 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
   </section>
 
   <div class="toast" id="toast"></div>
+
+  <div id="addbar">
+    <div class="inner">
+      <div id="chips"></div>
+      <div class="tabs" role="tablist">
+        <button id="tabFood" data-pane="paneFood">Food</button>
+        <button id="tabMeal" data-pane="paneMeal">Meal</button>
+        <button id="tabQuick" data-pane="paneQuick">Quick</button>
+      </div>
+      <div class="pane" id="paneFood" hidden>
+        <div class="row">
+          <input class="grow" id="foodSearch" type="search" placeholder="Search foods…" autocomplete="off">
+          <input id="foodGrams" type="number" inputmode="decimal" step="1" min="1" max="5000" placeholder="g" style="width:76px">
+          <button class="addbtn" id="foodAdd" disabled>Add</button>
+        </div>
+        <div class="preview" id="foodPreview"></div>
+        <div class="picklist" id="foodList"></div>
+      </div>
+      <div class="pane" id="paneMeal" hidden>
+        <div class="picklist" id="mealList"></div>
+      </div>
+      <div class="pane" id="paneQuick" hidden>
+        <div class="row">
+          <input id="quickKcal" type="number" inputmode="decimal" min="0" max="20000" placeholder="kcal" style="width:86px">
+          <input id="quickProtein" type="number" inputmode="decimal" min="0" max="1000" placeholder="protein g" style="width:100px">
+          <input class="grow" id="quickLabel" type="text" maxlength="80" placeholder="label (optional)">
+          <button class="addbtn" id="quickAdd">Add</button>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 <script>
 const App = {
-  state: { date: null, day: null },
+  state: { date: null, day: null, foods: [], meals: [], selFood: null },
 
   async api(action, body) {
     const opts = body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) };
@@ -894,6 +976,130 @@ const App = {
     clearTimeout(this._toastT);
     this._toastT = setTimeout(() => t.classList.remove('show'), 2200);
   },
+
+  async loadFavs() {
+    const [f, m] = await Promise.all([this.api('foods.list'), this.api('meals.list')]);
+    this.state.foods = f.foods;
+    this.state.meals = m.meals;
+    this.renderChips();
+    this.renderFoodList();
+    this.renderMealList();
+  },
+
+  async addEntry(payload) {
+    await this.api('entry.add', Object.assign({ day: this.state.date }, payload));
+    await Promise.all([this.load(this.state.date), this.loadFavs()]);
+  },
+
+  renderChips() {
+    const chips = document.getElementById('chips');
+    chips.innerHTML = '';
+    const cands = [
+      ...this.state.meals.map(m => ({ kind: 'meal', it: m })),
+      ...this.state.foods.map(f => ({ kind: 'food', it: f })),
+    ].sort((a, b) => b.it.use_count - a.it.use_count).slice(0, 8);
+    for (const { kind, it } of cands) {
+      const c = document.createElement('button');
+      c.className = 'chip ' + kind;
+      const name = document.createElement('span');
+      name.textContent = it.name;
+      const k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = kind === 'meal'
+        ? this.fmt(it.kcal) + ' kcal'
+        : this.fmt(it.last_grams ?? 100) + ' g';
+      c.append(name, k);
+      c.addEventListener('click', () => {
+        if (kind === 'meal') this.addEntry({ type: 'meal', meal_id: it.id });
+        else this.pickFood(it, true);
+      });
+      chips.appendChild(c);
+    }
+    chips.hidden = cands.length === 0;
+  },
+
+  pickFood(food, switchTab) {
+    this.state.selFood = food;
+    if (switchTab) this.setTab('tabFood');
+    const grams = document.getElementById('foodGrams');
+    grams.value = food.last_grams ?? 100;
+    document.getElementById('foodSearch').value = food.name;
+    this.renderFoodList(food.name);
+    this.foodPreview();
+    grams.focus();
+    grams.select();
+  },
+
+  foodPreview() {
+    const f = this.state.selFood;
+    const g = parseFloat(document.getElementById('foodGrams').value);
+    const prev = document.getElementById('foodPreview');
+    const btn = document.getElementById('foodAdd');
+    if (f && g > 0) {
+      prev.innerHTML = '<b>' + this.fmt(Math.round(f.kcal_per_100g * g / 100 * 10) / 10) +
+        '</b> kcal · <b>' + this.fmt(Math.round(f.protein_per_100g * g / 100 * 10) / 10) + '</b> g protein';
+      btn.disabled = false;
+    } else {
+      prev.textContent = f ? '' : 'pick a food';
+      btn.disabled = true;
+    }
+  },
+
+  renderFoodList(filter) {
+    const list = document.getElementById('foodList');
+    list.innerHTML = '';
+    const q = (filter || '').trim().toLowerCase();
+    for (const f of this.state.foods.filter(f => !q || f.name.toLowerCase().includes(q))) {
+      const b = document.createElement('button');
+      b.className = 'pick' + (this.state.selFood?.id === f.id ? ' sel' : '');
+      const name = document.createElement('span');
+      name.textContent = f.name;
+      const k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = this.fmt(f.kcal_per_100g) + ' kcal · ' + this.fmt(f.protein_per_100g) + ' g / 100 g';
+      b.append(name, k);
+      b.addEventListener('click', () => this.pickFood(f, false));
+      list.appendChild(b);
+    }
+    if (!list.children.length) {
+      const e = document.createElement('div');
+      e.className = 'pick zero';
+      e.textContent = this.state.foods.length ? 'No match.' : 'No favourite foods yet. Add them from the book icon.';
+      list.appendChild(e);
+    }
+  },
+
+  renderMealList() {
+    const list = document.getElementById('mealList');
+    list.innerHTML = '';
+    for (const m of this.state.meals) {
+      const b = document.createElement('button');
+      b.className = 'pick';
+      const name = document.createElement('span');
+      name.textContent = m.name;
+      const k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = this.fmt(m.kcal) + ' kcal · ' + this.fmt(m.protein) + ' g';
+      b.append(name, k);
+      b.addEventListener('click', () => this.addEntry({ type: 'meal', meal_id: m.id }));
+      list.appendChild(b);
+    }
+    if (!list.children.length) {
+      const e = document.createElement('div');
+      e.className = 'pick zero';
+      e.textContent = 'No favourite meals yet. Build them from the book icon.';
+      list.appendChild(e);
+    }
+  },
+
+  setTab(id) {
+    for (const t of document.querySelectorAll('.tabs button')) {
+      const on = t.id === id;
+      t.classList.toggle('on', on);
+      document.getElementById(t.dataset.pane).hidden = !on;
+    }
+    localStorage.setItem('glom_tab', id);
+  },
 };
 
 document.getElementById('prevDay').addEventListener('click', () => App.shiftDay(-1));
@@ -904,7 +1110,39 @@ document.getElementById('weightIn').addEventListener('change', async (e) => {
   App.load(App.state.date);
 });
 
+for (const t of document.querySelectorAll('.tabs button')) {
+  t.addEventListener('click', () => App.setTab(t.id));
+}
+document.getElementById('foodSearch').addEventListener('input', (e) => {
+  App.state.selFood = null;
+  App.renderFoodList(e.target.value);
+  App.foodPreview();
+});
+document.getElementById('foodGrams').addEventListener('input', () => App.foodPreview());
+document.getElementById('foodAdd').addEventListener('click', async () => {
+  const g = parseFloat(document.getElementById('foodGrams').value);
+  if (!App.state.selFood || !(g > 0)) return;
+  await App.addEntry({ type: 'food', food_id: App.state.selFood.id, grams: g });
+  document.getElementById('foodSearch').value = '';
+  App.state.selFood = null;
+  App.renderFoodList();
+  App.foodPreview();
+});
+document.getElementById('quickAdd').addEventListener('click', async () => {
+  const kcal = parseFloat(document.getElementById('quickKcal').value);
+  if (!(kcal >= 0)) { App.toast('kcal is required'); return; }
+  await App.addEntry({
+    type: 'quick',
+    kcal,
+    protein: parseFloat(document.getElementById('quickProtein').value) || 0,
+    label: document.getElementById('quickLabel').value,
+  });
+  for (const id of ['quickKcal', 'quickProtein', 'quickLabel']) document.getElementById(id).value = '';
+});
+
+App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
 App.load();
+App.loadFavs();
 </script>
 <?php endif; ?>
 </body>
