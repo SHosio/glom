@@ -746,7 +746,7 @@ function api(string $action): never {
             header('Location: ' . GLOM_WITHINGS_AUTHORIZE . '?' . http_build_query([
                 'response_type' => 'code',
                 'client_id'     => GLOM_WITHINGS_CLIENT_ID,
-                'scope'         => 'user.metrics',
+                'scope'         => 'user.metrics,user.activity', // weight + steps
                 'redirect_uri'  => app_url(),
                 'state'         => $state,
             ]));
