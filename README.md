@@ -20,7 +20,7 @@ The simplest calorie tracker on the planet. One PHP file, one SQLite database, t
 
 1. Copy `index.php` to any PHP 8.1+ host with pdo_sqlite (enabled almost everywhere).
 2. Make sure the web server can **write** to the directory (it creates `glom.sqlite` on first load).
-3. Edit the config block at the top of the file (PIN, cookie secret, ingest token, timezone).
+3. Put your real credentials in a `glom-config.local.php` next to it (PIN, cookie secret, ingest token, Withings keys) using the same `define()` calls as the config block in `index.php`. The main file ships with placeholders only and never needs editing.
 4. Deny direct HTTP access to `glom.sqlite*` (snippets for Apache and nginx are in the file header).
 5. Open the URL, log in, set your targets, add your favourite foods.
 

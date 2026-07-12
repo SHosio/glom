@@ -23,17 +23,21 @@
  */
 
 // ---------------------------------------------------------------- config ---
-const GLOM_PIN       = 'changeme';                 // login PIN
-const GLOM_SECRET    = 'change-this-to-a-long-random-string'; // signs the auth cookie
-const GLOM_DB        = __DIR__ . '/glom.sqlite';
-const GLOM_TZ        = 'Europe/Helsinki';
-const GLOM_API_TOKEN = 'change-this-ingest-token'; // for ?api=ingest (Health pushes)
-const GLOM_VERSION   = '0.2.0';                    // bump to bust the PWA cache
+// Real credentials belong in glom-config.local.php next to this file (same
+// define() calls, gitignored); the defaults below only fill whatever it omits.
+@include __DIR__ . '/glom-config.local.php';
+
+defined('GLOM_PIN')       || define('GLOM_PIN', 'changeme');                 // login PIN
+defined('GLOM_SECRET')    || define('GLOM_SECRET', 'change-this-to-a-long-random-string'); // signs the auth cookie
+defined('GLOM_DB')        || define('GLOM_DB', __DIR__ . '/glom.sqlite');
+defined('GLOM_TZ')        || define('GLOM_TZ', 'Europe/Helsinki');
+defined('GLOM_API_TOKEN') || define('GLOM_API_TOKEN', 'change-this-ingest-token'); // for ?api=ingest (Health pushes)
+defined('GLOM_VERSION')   || define('GLOM_VERSION', '0.2.0');                // bump to bust the PWA cache
 
 // Optional Withings weight sync: register a (free) app at developer.withings.com,
 // set the callback URL to this app's exact URL (no query string), paste keys here.
-const GLOM_WITHINGS_CLIENT_ID = '';
-const GLOM_WITHINGS_SECRET    = '';
+defined('GLOM_WITHINGS_CLIENT_ID') || define('GLOM_WITHINGS_CLIENT_ID', '');
+defined('GLOM_WITHINGS_SECRET')    || define('GLOM_WITHINGS_SECRET', '');
 const GLOM_WITHINGS_API       = 'https://wbsapi.withings.net';
 const GLOM_WITHINGS_AUTHORIZE = 'https://account.withings.com/oauth2_user/authorize2';
 

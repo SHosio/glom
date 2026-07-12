@@ -2,3 +2,4 @@ glom.sqlite*
 .playwright-mcp/
 *.png
 docs/
+glom-config.local.php
