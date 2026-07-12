@@ -7,15 +7,17 @@
  *   1. Copy this file to any PHP 8+ host with pdo_sqlite (enabled by default).
  *   2. Make sure the web server can WRITE to this directory (it creates glom.sqlite).
  *   3. Edit the config block below (PIN, SECRET, API TOKEN, timezone).
- *   4. Block direct access to the database file:
+ *   4. Block direct access to the database and the local config file. The config
+ *      is a .php file, so a working PHP handler executes it to empty output
+ *      rather than leaking it, but deny it anyway in case PHP is ever misconfigured:
  *
  *      Apache (.htaccess in this directory):
- *        <FilesMatch "^glom\.sqlite">
+ *        <FilesMatch "^(glom\.sqlite|glom-config\.local\.php)">
  *          Require all denied
  *        </FilesMatch>
  *
  *      nginx (inside the server block):
- *        location ~ /glom\.sqlite { deny all; }
+ *        location ~ /(glom\.sqlite|glom-config\.local\.php) { deny all; }
  *
  *   5. Open the URL, log in with your PIN, set targets, add your favourite foods.
  *
