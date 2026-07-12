@@ -294,6 +294,12 @@ function withings_sync(): int {
         'lastupdate' => $since,
     ], $token);
     if (($resp['status'] ?? -1) !== 0) return 0;
+    try {
+        // Withings reports the account's timezone; weigh-ins happen in that local day.
+        $tz = new DateTimeZone($resp['body']['timezone'] ?? GLOM_TZ);
+    } catch (Throwable) {
+        $tz = new DateTimeZone(GLOM_TZ);
+    }
     $grps = $resp['body']['measuregrps'] ?? [];
     usort($grps, fn($a, $b) => ($a['date'] ?? 0) <=> ($b['date'] ?? 0));
     $written = 0;
@@ -306,7 +312,7 @@ function withings_sync(): int {
             $kg = round((float)$m['value'] * (10 ** (int)($m['unit'] ?? 0)), 1);
             if ($kg < 20 || $kg > 400) continue;
             $day = (new DateTimeImmutable('@' . (int)$g['date']))
-                ->setTimezone(new DateTimeZone(GLOM_TZ))->format('Y-m-d');
+                ->setTimezone($tz)->format('Y-m-d');
             $st->execute([$day, $kg]);
             $written++;
         }
@@ -638,7 +644,8 @@ function api(string $action): never {
         case 'trend': {
             $n = (int)num($_GET['days'] ?? 30, 1, 365, 'days');
             $db = db();
-            $end = new DateTimeImmutable(today());
+            // The client passes its own local date as `end`; server time is only a fallback.
+            $end = new DateTimeImmutable(($_GET['end'] ?? '') === '' ? today() : valid_day($_GET['end']));
             $days = [];
             $kcalRows = $db->prepare('SELECT day, ROUND(SUM(kcal),1) AS kcal, ROUND(SUM(protein),1) AS protein
                                       FROM entries WHERE day >= ? GROUP BY day');
@@ -1340,8 +1347,16 @@ const App = {
     return d;
   },
 
+  // The phone's clock defines the day; the server timezone is only a fallback.
+  todayLocal() {
+    return this.dstr(new Date());
+  },
+
   async load(date) {
-    const d = await this.api('day&date=' + (date || ''));
+    const target = date || this.todayLocal();
+    // Remember whether the user is on "today", so waking after midnight follows the calendar.
+    this.state.followToday = target === this.todayLocal();
+    const d = await this.api('day&date=' + target);
     this.state.date = d.date;
     this.state.day = d;
     this.render();
@@ -1351,9 +1366,10 @@ const App = {
   // First open of the day with no weight yet: pull it from Withings once.
   maybeWithingsSync() {
     const d = this.state.day;
-    if (!d || d.withings !== 'connected' || d.date !== d.today || d.weight != null) return;
-    if (localStorage.getItem('glom_wsync') === d.today) return;
-    localStorage.setItem('glom_wsync', d.today);
+    const today = this.todayLocal();
+    if (!d || d.withings !== 'connected' || d.date !== today || d.weight != null) return;
+    if (localStorage.getItem('glom_wsync') === today) return;
+    localStorage.setItem('glom_wsync', today);
     this.api('withings.sync', {}).then((res) => {
       if (res.synced > 0) {
         this.toast('Weight synced from Withings');
@@ -1365,8 +1381,8 @@ const App = {
   fmt(n) { return Number(n) % 1 === 0 ? String(Number(n)) : Number(n).toFixed(1); },
 
   dateLabel() {
-    const { date, day } = this.state;
-    const t = new Date(day.today + 'T12:00:00');
+    const { date } = this.state;
+    const t = new Date(this.todayLocal() + 'T12:00:00');
     const d = new Date(date + 'T12:00:00');
     const diff = Math.round((t - d) / 86400000);
     if (diff === 0) return 'Today';
@@ -1832,7 +1848,7 @@ const App = {
       }).catch(() => this.toast('could not load charts'));
       if (!window.Chart) return;
     }
-    const d = await this.api('trend&days=30');
+    const d = await this.api('trend&days=30&end=' + this.todayLocal());
     this.renderTrends(d);
     body.hidden = false;
     btn.classList.add('open');
@@ -1922,8 +1938,7 @@ document.getElementById('weightIn').addEventListener('change', async (e) => {
 // A PWA resumed after midnight would otherwise keep logging to the stale "today"
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !App.state.day) return;
-  const wasToday = App.state.date === App.state.day.today;
-  App.load(wasToday ? undefined : App.state.date).catch(() => {});
+  App.load(App.state.followToday ? undefined : App.state.date).catch(() => {});
 });
 
 for (const t of document.querySelectorAll('#addbar .tabs button')) {
