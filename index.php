@@ -28,7 +28,14 @@ const GLOM_SECRET    = 'change-this-to-a-long-random-string'; // signs the auth 
 const GLOM_DB        = __DIR__ . '/glom.sqlite';
 const GLOM_TZ        = 'Europe/Helsinki';
 const GLOM_API_TOKEN = 'change-this-ingest-token'; // for ?api=ingest (Health pushes)
-const GLOM_VERSION   = '0.1.0';                    // bump to bust the PWA cache
+const GLOM_VERSION   = '0.2.0';                    // bump to bust the PWA cache
+
+// Optional Withings weight sync: register a (free) app at developer.withings.com,
+// set the callback URL to this app's exact URL (no query string), paste keys here.
+const GLOM_WITHINGS_CLIENT_ID = '';
+const GLOM_WITHINGS_SECRET    = '';
+const GLOM_WITHINGS_API       = 'https://wbsapi.withings.net';
+const GLOM_WITHINGS_AUTHORIZE = 'https://account.withings.com/oauth2_user/authorize2';
 
 date_default_timezone_set(GLOM_TZ);
 
@@ -153,6 +160,22 @@ function valid_day(mixed $s): string {
     fail('invalid date');
 }
 
+function setting(string $key): ?string {
+    $st = db()->prepare('SELECT value FROM settings WHERE key = ?');
+    $st->execute([$key]);
+    $v = $st->fetchColumn();
+    return $v === false ? null : (string)$v;
+}
+
+function setting_set(string $key, ?string $value): void {
+    if ($value === null) {
+        db()->prepare('DELETE FROM settings WHERE key = ?')->execute([$key]);
+    } else {
+        db()->prepare('INSERT INTO settings (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value')->execute([$key, $value]);
+    }
+}
+
 function get_targets(): array {
     $rows = db()->query("SELECT key, value FROM settings WHERE key IN ('kcal_target','protein_target')")
                 ->fetchAll(PDO::FETCH_KEY_PAIR);
@@ -176,6 +199,134 @@ function meal_totals(int $mealId): array {
     $row->execute([$mealId]);
     $t = $row->fetch();
     return ['kcal' => round((float)$t['kcal'], 1), 'protein' => round((float)$t['protein'], 1)];
+}
+
+// -------------------------------------------------------------- withings ---
+
+/** Absolute URL of this script without any query string (the OAuth redirect URI). */
+function app_url(): string {
+    $https = !empty($_SERVER['HTTPS']) || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    return ($https ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . ($_SERVER['SCRIPT_NAME'] ?? '/index.php');
+}
+
+/** POST form fields, return decoded JSON array or null. Uses curl when available. */
+function http_post_form(string $url, array $fields, ?string $bearer = null): ?array {
+    $body = http_build_query($fields);
+    $headers = ['Content-Type: application/x-www-form-urlencoded'];
+    if ($bearer !== null) $headers[] = 'Authorization: Bearer ' . $bearer;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $body,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 15,
+        ]);
+        $resp = curl_exec($ch);
+    } else {
+        $resp = @file_get_contents($url, false, stream_context_create(['http' => [
+            'method' => 'POST',
+            'header' => implode("\r\n", $headers),
+            'content' => $body,
+            'timeout' => 15,
+            'ignore_errors' => true,
+        ]]));
+    }
+    if (!is_string($resp)) return null;
+    $data = json_decode($resp, true);
+    return is_array($data) ? $data : null;
+}
+
+/** 'off' (no API keys), 'disconnected' (keys but no tokens), or 'connected'. */
+function withings_status(): string {
+    if (GLOM_WITHINGS_CLIENT_ID === '') return 'off';
+    return setting('withings_refresh_token') !== null ? 'connected' : 'disconnected';
+}
+
+function withings_clear(): void {
+    foreach (['withings_access_token', 'withings_refresh_token', 'withings_expires_at', 'withings_state', 'withings_last_sync'] as $k) {
+        setting_set($k, null);
+    }
+}
+
+/** Exchange or refresh tokens via Withings' requesttoken action. Returns true on success. */
+function withings_request_token(array $grantFields): bool {
+    $resp = http_post_form(GLOM_WITHINGS_API . '/v2/oauth2', $grantFields + [
+        'action'        => 'requesttoken',
+        'client_id'     => GLOM_WITHINGS_CLIENT_ID,
+        'client_secret' => GLOM_WITHINGS_SECRET,
+    ]);
+    if (($resp['status'] ?? -1) !== 0 || empty($resp['body']['access_token'])) return false;
+    $b = $resp['body'];
+    setting_set('withings_access_token', $b['access_token']);
+    setting_set('withings_refresh_token', $b['refresh_token'] ?? '');
+    setting_set('withings_expires_at', (string)(time() + (int)($b['expires_in'] ?? 3600) - 60));
+    return true;
+}
+
+/** Valid access token, refreshing if needed; null when disconnected or refresh fails. */
+function withings_access_token(): ?string {
+    if (withings_status() !== 'connected') return null;
+    if (time() < (int)setting('withings_expires_at')) return setting('withings_access_token');
+    $ok = withings_request_token([
+        'grant_type'    => 'refresh_token',
+        'refresh_token' => setting('withings_refresh_token'),
+    ]);
+    if (!$ok) { withings_clear(); return null; }
+    return setting('withings_access_token');
+}
+
+/** Pull weight measurements since last sync and upsert into weights. Returns rows written. */
+function withings_sync(): int {
+    $token = withings_access_token();
+    if ($token === null) return 0;
+    $since = (int)(setting('withings_last_sync') ?? 0);
+    if ($since === 0) $since = time() - 30 * 86400; // first sync: last 30 days
+    $resp = http_post_form(GLOM_WITHINGS_API . '/measure', [
+        'action'     => 'getmeas',
+        'meastypes'  => '1',   // weight
+        'category'   => 1,     // real measurements, not goals
+        'lastupdate' => $since,
+    ], $token);
+    if (($resp['status'] ?? -1) !== 0) return 0;
+    $grps = $resp['body']['measuregrps'] ?? [];
+    usort($grps, fn($a, $b) => ($a['date'] ?? 0) <=> ($b['date'] ?? 0));
+    $written = 0;
+    $st = db()->prepare('INSERT INTO weights (day, kg) VALUES (?, ?)
+                         ON CONFLICT(day) DO UPDATE SET kg = excluded.kg');
+    foreach ($grps as $g) {
+        if (($g['category'] ?? 0) !== 1) continue;
+        foreach ($g['measures'] ?? [] as $m) {
+            if (($m['type'] ?? 0) !== 1) continue;
+            $kg = round((float)$m['value'] * (10 ** (int)($m['unit'] ?? 0)), 1);
+            if ($kg < 20 || $kg > 400) continue;
+            $day = (new DateTimeImmutable('@' . (int)$g['date']))
+                ->setTimezone(new DateTimeZone(GLOM_TZ))->format('Y-m-d');
+            $st->execute([$day, $kg]);
+            $written++;
+        }
+    }
+    setting_set('withings_last_sync', (string)((int)($resp['body']['updatetime'] ?? time())));
+    return $written;
+}
+
+/** Handles the OAuth redirect back from Withings (GET ?code=...&state=...). */
+function withings_callback(): never {
+    if (!auth_ok()) { header('Location: ' . app_url()); exit; }
+    $stored = setting('withings_state');
+    if ($stored === null || !hash_equals($stored, (string)($_GET['state'] ?? ''))) {
+        header('Location: ' . app_url() . '?withings=error');
+        exit;
+    }
+    setting_set('withings_state', null);
+    $ok = withings_request_token([
+        'grant_type'   => 'authorization_code',
+        'code'         => (string)$_GET['code'],
+        'redirect_uri' => app_url(),
+    ]);
+    header('Location: ' . app_url() . ($ok ? '?withings=connected' : '?withings=error'));
+    exit;
 }
 
 // ------------------------------------------------------------------ auth ---
@@ -207,6 +358,11 @@ function auth_cookie(string $value, int $maxAge): void {
 
 $api   = $_GET['api']   ?? null;
 $asset = $_GET['asset'] ?? null;
+
+// Withings OAuth lands back on the bare app URL with ?code=&state=
+if ($api === null && $asset === null && isset($_GET['code'], $_GET['state'])) {
+    withings_callback();
+}
 
 if ($api !== null) {
     try {
@@ -471,6 +627,7 @@ function api(string $action): never {
                 'prev_weight' => $prev === false ? null : (float)$prev,
                 'totals' => $totals,
                 'targets' => get_targets(),
+                'withings' => withings_status(),
             ]);
         }
 
@@ -522,6 +679,35 @@ function api(string $action): never {
             }
             $pass = $missing === [] && $mathOk;
             json_out(['ok' => true, 'pass' => $pass, 'missing_tables' => $missing, 'meal_math' => $mathOk]);
+        }
+
+        case 'withings.connect': {
+            if (GLOM_WITHINGS_CLIENT_ID === '') fail('Withings API keys not configured');
+            $state = bin2hex(random_bytes(16));
+            setting_set('withings_state', $state);
+            header('Location: ' . GLOM_WITHINGS_AUTHORIZE . '?' . http_build_query([
+                'response_type' => 'code',
+                'client_id'     => GLOM_WITHINGS_CLIENT_ID,
+                'scope'         => 'user.metrics',
+                'redirect_uri'  => app_url(),
+                'state'         => $state,
+            ]));
+            exit;
+        }
+
+        case 'withings.sync': {
+            require_post();
+            if (withings_status() !== 'connected') {
+                json_out(['ok' => true, 'connected' => false, 'synced' => 0]);
+            }
+            $n = withings_sync();
+            json_out(['ok' => true, 'connected' => withings_status() === 'connected', 'synced' => $n]);
+        }
+
+        case 'withings.disconnect': {
+            require_post();
+            withings_clear();
+            json_out(['ok' => true]);
         }
 
         case 'ingest': {
@@ -1118,6 +1304,13 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
     <div class="btnrow" style="margin-top:16px">
       <button class="btn-primary" id="setSave">Save targets</button>
     </div>
+    <div class="settings-row" id="wRow" hidden>
+      <label>Withings scale</label>
+      <span id="wStatus" style="color:var(--ink-soft);font-weight:600"></span>
+    </div>
+    <div class="btnrow" id="wBtnRow" hidden>
+      <button class="btn-primary" id="wBtn"></button>
+    </div>
     <button class="logout" id="logoutBtn">Log out</button>
   </div>
 </div>
@@ -1148,6 +1341,21 @@ const App = {
     this.state.date = d.date;
     this.state.day = d;
     this.render();
+    this.maybeWithingsSync();
+  },
+
+  // First open of the day with no weight yet: pull it from Withings once.
+  maybeWithingsSync() {
+    const d = this.state.day;
+    if (!d || d.withings !== 'connected' || d.date !== d.today || d.weight != null) return;
+    if (localStorage.getItem('glom_wsync') === d.today) return;
+    localStorage.setItem('glom_wsync', d.today);
+    this.api('withings.sync', {}).then((res) => {
+      if (res.synced > 0) {
+        this.toast('Weight synced from Withings');
+        this.load(this.state.date);
+      }
+    }).catch(() => {});
   },
 
   fmt(n) { return Number(n) % 1 === 0 ? String(Number(n)) : Number(n).toFixed(1); },
@@ -1402,6 +1610,13 @@ const App = {
     if (id === 'gearPanel') {
       document.getElementById('setKcal').value = this.state.day?.targets.kcal ?? '';
       document.getElementById('setProtein').value = this.state.day?.targets.protein ?? '';
+      const w = this.state.day?.withings || 'off';
+      document.getElementById('wRow').hidden = w === 'off';
+      document.getElementById('wBtnRow').hidden = w === 'off';
+      if (w !== 'off') {
+        document.getElementById('wStatus').textContent = w === 'connected' ? 'Connected ✓' : 'Not connected';
+        document.getElementById('wBtn').textContent = w === 'connected' ? 'Disconnect' : 'Connect Withings';
+      }
     }
   },
 
@@ -1801,6 +2016,22 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
   await App.api('logout', {});
   location.reload();
 });
+document.getElementById('wBtn').addEventListener('click', async () => {
+  if (App.state.day?.withings === 'connected') {
+    await App.api('withings.disconnect', {});
+    App.closePanels();
+    App.load(App.state.date);
+  } else {
+    location.href = 'index.php?api=withings.connect';
+  }
+});
+
+const wq = new URLSearchParams(location.search).get('withings');
+if (wq) {
+  App.toast(wq === 'connected' ? 'Withings connected' : 'Withings connection failed');
+  history.replaceState(null, '', location.pathname);
+  if (wq === 'connected') localStorage.removeItem('glom_wsync');
+}
 
 App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
 App.load();

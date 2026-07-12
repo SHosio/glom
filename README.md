@@ -14,6 +14,7 @@ The simplest calorie tracker on the planet. One PHP file, one SQLite database, t
 - Installable PWA. The shell opens offline, logging needs network.
 - Entries store snapshots, so editing a favourite food later never rewrites history.
 - A token-guarded `?api=ingest` endpoint accepts `{date, metric, value}` rows for automated weight and steps pushes (iOS Shortcuts, Health Auto Export, or a scale-vendor cron).
+- **Withings scale sync** (optional). Register a free app at developer.withings.com, paste the keys into the config block, tap Connect in settings. After that, the first time you open glom each day it pulls your morning weigh-in automatically. A free Withings account is enough.
 
 ## Deploy
 
