@@ -101,14 +101,21 @@ function db(): PDO {
             );
             CREATE INDEX IF NOT EXISTS idx_entries_day ON entries(day);
             CREATE TABLE IF NOT EXISTS weights (
-                day TEXT PRIMARY KEY,
-                kg  REAL NOT NULL
+                day    TEXT PRIMARY KEY,
+                kg     REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual'
             );
             CREATE TABLE IF NOT EXISTS steps (
                 day   TEXT PRIMARY KEY,
                 count INTEGER NOT NULL
             );
             SQL);
+        // Migration for databases created before v0.3: weights gained a source column.
+        try {
+            $pdo->exec("ALTER TABLE weights ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
+        } catch (PDOException) {
+            // column already exists
+        }
     }
     return $pdo;
 }
@@ -283,19 +290,21 @@ function withings_access_token(): ?string {
     return setting('withings_access_token');
 }
 
-/** Pull weight measurements since last sync and upsert into weights. Returns rows written. */
-function withings_sync(): int {
+/** Pull weight and steps since last sync, upsert them, return per-metric counts. */
+function withings_sync(bool $full = false): array {
+    $out = ['weights' => 0, 'steps' => 0, 'getmeas_status' => null, 'getactivity_status' => null, 'activity_days' => 0];
     $token = withings_access_token();
-    if ($token === null) return 0;
-    $since = (int)(setting('withings_last_sync') ?? 0);
-    if ($since === 0) $since = time() - 30 * 86400; // first sync: last 30 days
+    if ($token === null) return $out;
+    $since = $full ? 0 : (int)(setting('withings_last_sync') ?? 0);
+    if ($since === 0) $since = time() - 30 * 86400; // first (or full) sync: last 30 days
     $resp = http_post_form(GLOM_WITHINGS_API . '/measure', [
         'action'     => 'getmeas',
         'meastypes'  => '1',   // weight
         'category'   => 1,     // real measurements, not goals
         'lastupdate' => $since,
     ], $token);
-    if (($resp['status'] ?? -1) !== 0) return 0;
+    $out['getmeas_status'] = $resp['status'] ?? null;
+    if (($resp['status'] ?? -1) !== 0) return $out;
     try {
         // Withings reports the account's timezone; weigh-ins happen in that local day.
         $tz = new DateTimeZone($resp['body']['timezone'] ?? GLOM_TZ);
@@ -304,9 +313,11 @@ function withings_sync(): int {
     }
     $grps = $resp['body']['measuregrps'] ?? [];
     usort($grps, fn($a, $b) => ($a['date'] ?? 0) <=> ($b['date'] ?? 0));
-    $written = 0;
-    $st = db()->prepare('INSERT INTO weights (day, kg) VALUES (?, ?)
-                         ON CONFLICT(day) DO UPDATE SET kg = excluded.kg');
+    // Groups are sorted ascending, so the day's LAST weigh-in ends up stored.
+    // Manual rows are never overwritten: what you type is the final word.
+    $st = db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'withings')
+                         ON CONFLICT(day) DO UPDATE SET kg = excluded.kg
+                         WHERE weights.source != 'manual'");
     foreach ($grps as $g) {
         if (($g['category'] ?? 0) !== 1) continue;
         foreach ($g['measures'] ?? [] as $m) {
@@ -316,29 +327,35 @@ function withings_sync(): int {
             $day = (new DateTimeImmutable('@' . (int)$g['date']))
                 ->setTimezone($tz)->format('Y-m-d');
             $st->execute([$day, $kg]);
-            $written++;
+            $out['weights']++;
         }
     }
     // Steps come from the activity API (phone-tracked steps in Health Mate count too).
+    // Date-range form rather than lastupdate: activity days get rewritten all day long,
+    // and we always want the current totals for the recent window.
     $act = http_post_form(GLOM_WITHINGS_API . '/v2/measure', [
-        'action'      => 'getactivity',
-        'data_fields' => 'steps',
-        'lastupdate'  => $since,
+        'action'       => 'getactivity',
+        'data_fields'  => 'steps',
+        'startdateymd' => (new DateTimeImmutable('@' . $since))->setTimezone($tz)->format('Y-m-d'),
+        'enddateymd'   => (new DateTimeImmutable('now', $tz))->format('Y-m-d'),
     ], $token);
+    $out['getactivity_status'] = $act['status'] ?? null;
     if (($act['status'] ?? -1) === 0) {
+        $acts = $act['body']['activities'] ?? [];
+        $out['activity_days'] = count($acts);
         $sSt = db()->prepare('INSERT INTO steps (day, count) VALUES (?, ?)
                               ON CONFLICT(day) DO UPDATE SET count = excluded.count');
-        foreach ($act['body']['activities'] ?? [] as $a) {
+        foreach ($acts as $a) {
             $d = (string)($a['date'] ?? '');
             $n = $a['steps'] ?? null;
             if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) && is_numeric($n) && $n >= 0 && $n <= 500000) {
                 $sSt->execute([$d, (int)$n]);
-                $written++;
+                $out['steps']++;
             }
         }
     }
     setting_set('withings_last_sync', (string)((int)($resp['body']['updatetime'] ?? time())));
-    return $written;
+    return $out;
 }
 
 /** Handles the OAuth redirect back from Withings (GET ?code=...&state=...). */
@@ -613,8 +630,10 @@ function api(string $action): never {
                 json_out(['ok' => true, 'kg' => null]);
             }
             $kg = num($kg, 20, 400, 'weight');
-            db()->prepare('INSERT INTO weights (day, kg) VALUES (?, ?)
-                           ON CONFLICT(day) DO UPDATE SET kg = excluded.kg')->execute([$day, $kg]);
+            // Typed by hand, so it outranks any automated source and future syncs leave it alone.
+            db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'manual')
+                           ON CONFLICT(day) DO UPDATE SET kg = excluded.kg, source = 'manual'")
+                ->execute([$day, $kg]);
             json_out(['ok' => true, 'kg' => $kg]);
         }
 
@@ -737,10 +756,10 @@ function api(string $action): never {
         case 'withings.sync': {
             require_post();
             if (withings_status() !== 'connected') {
-                json_out(['ok' => true, 'connected' => false, 'synced' => 0]);
+                json_out(['ok' => true, 'connected' => false, 'weights' => 0, 'steps' => 0]);
             }
-            $n = withings_sync();
-            json_out(['ok' => true, 'connected' => withings_status() === 'connected', 'synced' => $n]);
+            $r = withings_sync(!empty(body()['full']));
+            json_out(['ok' => true, 'connected' => withings_status() === 'connected'] + $r);
         }
 
         case 'withings.disconnect': {
@@ -758,8 +777,9 @@ function api(string $action): never {
             if (!is_array($rows)) fail('rows required (array of {date, metric, value})');
             $written = 0;
             $skipped = 0;
-            $wSt = db()->prepare('INSERT INTO weights (day, kg) VALUES (?, ?)
-                                  ON CONFLICT(day) DO UPDATE SET kg = excluded.kg');
+            $wSt = db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'ingest')
+                                  ON CONFLICT(day) DO UPDATE SET kg = excluded.kg
+                                  WHERE weights.source != 'manual'");
             $sSt = db()->prepare('INSERT INTO steps (day, count) VALUES (?, ?)
                                   ON CONFLICT(day) DO UPDATE SET count = excluded.count');
             foreach ($rows as $r) {
@@ -1411,11 +1431,18 @@ const App = {
     if (localStorage.getItem('glom_wsync') === today) return;
     localStorage.setItem('glom_wsync', today);
     this.api('withings.sync', {}).then((res) => {
-      if (res.synced > 0) {
-        this.toast('Weight synced from Withings');
+      if (res.weights > 0 || res.steps > 0) {
+        this.toast(this.syncMsg(res));
         this.load(this.state.date);
       }
     }).catch(() => {});
+  },
+
+  syncMsg(res) {
+    const parts = [];
+    if (res.weights > 0) parts.push('weight');
+    if (res.steps > 0) parts.push('steps');
+    return parts.length ? 'Synced ' + parts.join(' + ') + ' from Withings' : 'Nothing new at Withings';
   },
 
   fmt(n) { return Number(n) % 1 === 0 ? String(Number(n)) : Number(n).toFixed(1); },
@@ -1990,8 +2017,10 @@ document.getElementById('wSync').addEventListener('click', async (e) => {
   if (btn.classList.contains('spin')) return;
   btn.classList.add('spin');
   try {
-    const res = await App.api('withings.sync', {});
-    App.toast(res.synced > 0 ? 'Synced ' + res.synced + ' from Withings' : 'Nothing new at Withings');
+    // Manual tap = the user wants everything current: re-pull the whole 30-day window,
+    // ignoring the incremental cursor. Manual weight entries are never overwritten.
+    const res = await App.api('withings.sync', { full: true });
+    App.toast(App.syncMsg(res));
     await App.load(App.state.date);
   } finally {
     btn.classList.remove('spin');
