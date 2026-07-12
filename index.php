@@ -1,6 +1,6 @@
 <?php
 /**
- * glom — the simplest possible calorie tracker.
+ * glom, the simplest possible calorie tracker.
  * One file. Tracks daily weight, kcal, protein. That's it.
  *
  * DEPLOY
@@ -196,7 +196,8 @@ function auth_cookie(string $value, int $maxAge): void {
     setcookie('glom_auth', $value, [
         'expires'  => time() + $maxAge,
         'path'     => '/',
-        'secure'   => !empty($_SERVER['HTTPS']),
+        'secure'   => !empty($_SERVER['HTTPS'])
+                      || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https'),
         'httponly' => true,
         'samesite' => 'Lax',
     ]);
@@ -284,7 +285,9 @@ function api(string $action): never {
                 'SELECT id, name, use_count FROM meals WHERE archived = 0 ORDER BY use_count DESC, name'
             )->fetchAll();
             $itemsStmt = db()->prepare(
-                'SELECT mi.id, mi.food_id, f.name AS food_name, mi.grams, mi.raw_label, mi.raw_kcal, mi.raw_protein
+                'SELECT mi.id, mi.food_id, f.name AS food_name, f.archived AS food_archived,
+                        f.kcal_per_100g AS food_kcal, f.protein_per_100g AS food_protein,
+                        mi.grams, mi.raw_label, mi.raw_kcal, mi.raw_protein
                  FROM meal_items mi LEFT JOIN foods f ON f.id = mi.food_id
                  WHERE mi.meal_id = ? ORDER BY mi.id'
             );
@@ -489,8 +492,9 @@ function api(string $action): never {
                 $d = $end->modify("-$i days")->format('Y-m-d');
                 $days[] = [
                     'day'     => $d,
-                    'kcal'    => (float)($byDay[$d]['kcal'] ?? 0),
-                    'protein' => (float)($byDay[$d]['protein'] ?? 0),
+                    // null (not 0) when nothing was logged, so charts show a gap for untracked days
+                    'kcal'    => isset($byDay[$d]) ? (float)$byDay[$d]['kcal'] : null,
+                    'protein' => isset($byDay[$d]) ? (float)$byDay[$d]['protein'] : null,
                     'weight'  => isset($wByDay[$d]) ? (float)$wByDay[$d] : null,
                 ];
             }
@@ -872,7 +876,7 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 }
 .pick:active, .pick.sel { background: var(--track); }
 .pick .k { margin-left: auto; color: var(--ink-soft); font-weight: 600; font-size: .9rem; white-space: nowrap; }
-.pick .zero { color: var(--ink-soft); font-weight: 600; }
+.pick.zero { color: var(--ink-soft); font-weight: 600; }
 .preview { margin-top: 8px; color: var(--ink-soft); font-weight: 700; text-align: center; min-height: 1.3em; }
 .preview b { color: var(--ink); }
 
@@ -913,7 +917,6 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
   background: var(--bg); outline: none; font-weight: 600; flex: 1;
 }
 .mgr-form input:focus { border-color: var(--green); }
-.mgr-form .hint { color: var(--ink-soft); font-size: .82rem; font-weight: 600; }
 .mgr-form .itemrow { display: flex; gap: 6px; align-items: center; }
 .mgr-form .itemrow .rm { color: var(--red); font-weight: 800; padding: 4px 8px; }
 .mgr-form .switch { color: var(--green-deep); font-weight: 700; font-size: .85rem; text-align: left; }
@@ -1040,7 +1043,7 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
       <div class="pane" id="paneFood" hidden>
         <div class="row">
           <input class="grow" id="foodSearch" type="search" placeholder="Search foods…" autocomplete="off">
-          <input id="foodGrams" type="number" inputmode="decimal" step="1" min="1" max="5000" placeholder="g" style="width:76px">
+          <input id="foodGrams" type="number" inputmode="decimal" step="any" min="0.1" max="5000" placeholder="g" style="width:76px">
           <button class="addbtn" id="foodAdd" disabled>Add</button>
         </div>
         <div class="preview" id="foodPreview"></div>
@@ -1131,7 +1134,10 @@ const App = {
       this.toast('offline, not saved');
       throw new Error('offline');
     }
-    if (r.status === 401) { location.reload(); throw new Error('unauthorized'); }
+    if (r.status === 401) {
+      if (!this._reloading) { this._reloading = true; location.reload(); }
+      throw new Error('unauthorized');
+    }
     const d = await r.json();
     if (!d.ok) { this.toast(d.error || 'error'); throw new Error(d.error); }
     return d;
@@ -1156,10 +1162,16 @@ const App = {
     return d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
   },
 
+  dstr(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  },
+
   shiftDay(n) {
+    if (!this.state.date) return;
     const d = new Date(this.state.date + 'T12:00:00');
     d.setDate(d.getDate() + n);
-    this.load(d.toISOString().slice(0, 10));
+    this.load(this.dstr(d));
   },
 
   render() {
@@ -1479,9 +1491,21 @@ const App = {
         o.textContent = f.name;
         sel.appendChild(o);
       }
+      if (preset?.food_id && !this.state.foods.some(f => Number(f.id) === Number(preset.food_id))) {
+        // Archived food still referenced by this meal: keep it selectable so saving
+        // the meal doesn't silently drop the ingredient.
+        const o = document.createElement('option');
+        o.value = preset.food_id;
+        o.textContent = (preset.food_name || 'archived food') + ' (archived)';
+        sel.appendChild(o);
+        this._archFoods.set(Number(preset.food_id), {
+          kcal_per_100g: Number(preset.food_kcal) || 0,
+          protein_per_100g: Number(preset.food_protein) || 0,
+        });
+      }
       if (preset?.food_id) sel.value = preset.food_id;
       const g = document.createElement('input');
-      g.type = 'number'; g.min = '1'; g.max = '5000'; g.placeholder = 'g';
+      g.type = 'number'; g.min = '0.1'; g.max = '5000'; g.step = 'any'; g.placeholder = 'g';
       g.style.flex = '1';
       g.value = preset?.grams ?? '';
       sel.addEventListener('change', () => this.mealFormTotal());
@@ -1493,11 +1517,11 @@ const App = {
       lbl.style.flex = '2';
       lbl.value = preset?.raw_label ?? '';
       const k = document.createElement('input');
-      k.type = 'number'; k.min = '0'; k.placeholder = 'kcal';
+      k.type = 'number'; k.min = '0'; k.step = 'any'; k.placeholder = 'kcal';
       k.style.flex = '1';
       k.value = preset?.raw_kcal ?? '';
       const p = document.createElement('input');
-      p.type = 'number'; p.min = '0'; p.placeholder = 'prot g';
+      p.type = 'number'; p.min = '0'; p.step = 'any'; p.placeholder = 'prot g';
       p.style.flex = '1';
       p.value = preset?.raw_protein ?? '';
       k.addEventListener('input', () => this.mealFormTotal());
@@ -1514,6 +1538,8 @@ const App = {
     this.mealFormTotal();
   },
 
+  _archFoods: new Map(),
+
   mealFormItems() {
     const items = [];
     for (const row of document.querySelectorAll('#mfItems .itemrow')) {
@@ -1522,7 +1548,7 @@ const App = {
         if (sel.value && parseFloat(g.value) > 0) items.push({ food_id: +sel.value, grams: +g.value });
       } else {
         const [lbl, k, p] = row.querySelectorAll('input');
-        if (k.value !== '' || p.value !== '') {
+        if (lbl.value !== '' || k.value !== '' || p.value !== '') {
           items.push({ raw_label: lbl.value, raw_kcal: +k.value || 0, raw_protein: +p.value || 0 });
         }
       }
@@ -1534,7 +1560,7 @@ const App = {
     let kcal = 0, protein = 0;
     for (const it of this.mealFormItems()) {
       if (it.food_id) {
-        const f = this.state.foods.find(f => f.id === it.food_id);
+        const f = this.state.foods.find(f => Number(f.id) === it.food_id) || this._archFoods.get(it.food_id);
         if (f) { kcal += f.kcal_per_100g * it.grams / 100; protein += f.protein_per_100g * it.grams / 100; }
       } else {
         kcal += it.raw_kcal; protein += it.raw_protein;
@@ -1604,7 +1630,6 @@ const App = {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      plugins: { legend: { display: false }, tooltip: { displayColors: false } },
       scales: {
         x: {
           grid: { display: false },
@@ -1648,7 +1673,7 @@ const App = {
       new Chart(document.getElementById('chKcal'), {
         type: 'bar',
         data: { labels, datasets: [
-          { data: days.map(d => d.kcal || null), backgroundColor: amber, borderRadius: 3, barPercentage: .7, order: 1 },
+          { data: days.map(d => d.kcal), backgroundColor: amber, borderRadius: 3, barPercentage: .7, order: 1 },
           targetLine(targets.kcal),
         ] },
         options: Object.assign({}, base, { plugins: { legend: { display: false }, tooltip: tip('kcal') } }),
@@ -1656,7 +1681,7 @@ const App = {
       new Chart(document.getElementById('chProtein'), {
         type: 'line',
         data: { labels, datasets: [
-          { data: days.map(d => d.protein || null), borderColor: green, backgroundColor: green,
+          { data: days.map(d => d.protein), borderColor: green, backgroundColor: green,
             borderWidth: 2, pointRadius: 2, pointHitRadius: 10, spanGaps: false, tension: .3 },
           targetLine(targets.protein),
         ] },
@@ -1670,8 +1695,16 @@ document.getElementById('prevDay').addEventListener('click', () => App.shiftDay(
 document.getElementById('nextDay').addEventListener('click', () => App.shiftDay(1));
 document.getElementById('datePick').addEventListener('change', (e) => App.load(e.target.value));
 document.getElementById('weightIn').addEventListener('change', async (e) => {
+  if (e.target.validity.badInput) return; // rejected keystrokes read as '', which would delete the weight
   await App.api('weight.set', { day: App.state.date, kg: e.target.value });
   App.load(App.state.date);
+});
+
+// A PWA resumed after midnight would otherwise keep logging to the stale "today"
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !App.state.day) return;
+  const wasToday = App.state.date === App.state.day.today;
+  App.load(wasToday ? undefined : App.state.date).catch(() => {});
 });
 
 for (const t of document.querySelectorAll('#addbar .tabs button')) {
