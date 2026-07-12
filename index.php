@@ -291,7 +291,7 @@ function withings_access_token(): ?string {
 }
 
 /** Pull weight and steps since last sync, upsert them, return per-metric counts. */
-function withings_sync(bool $full = false): array {
+function withings_sync(bool $full = false, bool $debug = false): array {
     $out = ['weights' => 0, 'steps' => 0, 'getmeas_status' => null, 'getactivity_status' => null, 'activity_days' => 0];
     $token = withings_access_token();
     if ($token === null) return $out;
@@ -333,13 +333,17 @@ function withings_sync(bool $full = false): array {
     // Steps come from the activity API (phone-tracked steps in Health Mate count too).
     // Date-range form rather than lastupdate: activity days get rewritten all day long,
     // and we always want the current totals for the recent window.
-    $act = http_post_form(GLOM_WITHINGS_API . '/v2/measure', [
+    $actReq = [
         'action'       => 'getactivity',
         'data_fields'  => 'steps',
         'startdateymd' => (new DateTimeImmutable('@' . $since))->setTimezone($tz)->format('Y-m-d'),
         'enddateymd'   => (new DateTimeImmutable('now', $tz))->format('Y-m-d'),
-    ], $token);
+    ];
+    $act = http_post_form(GLOM_WITHINGS_API . '/v2/measure', $actReq, $token);
     $out['getactivity_status'] = $act['status'] ?? null;
+    if ($debug) {
+        $out['debug'] = ['getactivity_request' => $actReq, 'getactivity_response' => $act];
+    }
     if (($act['status'] ?? -1) === 0) {
         $acts = $act['body']['activities'] ?? [];
         $out['activity_days'] = count($acts);
@@ -758,7 +762,7 @@ function api(string $action): never {
             if (withings_status() !== 'connected') {
                 json_out(['ok' => true, 'connected' => false, 'weights' => 0, 'steps' => 0]);
             }
-            $r = withings_sync(!empty(body()['full']));
+            $r = withings_sync(!empty(body()['full']), !empty(body()['debug']));
             json_out(['ok' => true, 'connected' => withings_status() === 'connected'] + $r);
         }
 
