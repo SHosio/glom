@@ -1,3 +1,4 @@
 glom.sqlite*
 .playwright-mcp/
 *.png
+docs/
