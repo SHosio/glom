@@ -319,6 +319,24 @@ function withings_sync(): int {
             $written++;
         }
     }
+    // Steps come from the activity API (phone-tracked steps in Health Mate count too).
+    $act = http_post_form(GLOM_WITHINGS_API . '/v2/measure', [
+        'action'      => 'getactivity',
+        'data_fields' => 'steps',
+        'lastupdate'  => $since,
+    ], $token);
+    if (($act['status'] ?? -1) === 0) {
+        $sSt = db()->prepare('INSERT INTO steps (day, count) VALUES (?, ?)
+                              ON CONFLICT(day) DO UPDATE SET count = excluded.count');
+        foreach ($act['body']['activities'] ?? [] as $a) {
+            $d = (string)($a['date'] ?? '');
+            $n = $a['steps'] ?? null;
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) && is_numeric($n) && $n >= 0 && $n <= 500000) {
+                $sSt->execute([$d, (int)$n]);
+                $written++;
+            }
+        }
+    }
     setting_set('withings_last_sync', (string)((int)($resp['body']['updatetime'] ?? time())));
     return $written;
 }
@@ -632,11 +650,19 @@ function api(string $action): never {
             $st = $db->prepare('SELECT kg FROM weights WHERE day < ? ORDER BY day DESC LIMIT 1');
             $st->execute([$date]);
             $prev = $st->fetchColumn();
+            $st = $db->prepare('SELECT count FROM steps WHERE day = ?');
+            $st->execute([$date]);
+            $steps = $st->fetchColumn();
+            $st = $db->prepare('SELECT count FROM steps WHERE day < ? ORDER BY day DESC LIMIT 1');
+            $st->execute([$date]);
+            $prevSteps = $st->fetchColumn();
             json_out([
                 'ok' => true, 'date' => $date, 'today' => today(),
                 'entries' => $entries,
                 'weight' => $weight === false ? null : (float)$weight,
                 'prev_weight' => $prev === false ? null : (float)$prev,
+                'steps' => $steps === false ? null : (int)$steps,
+                'prev_steps' => $prevSteps === false ? null : (int)$prevSteps,
                 'totals' => $totals,
                 'targets' => get_targets(),
                 'withings' => withings_status(),
@@ -968,15 +994,22 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
   background: var(--card); border: 1px solid var(--line); border-radius: 18px;
   padding: 12px 16px; margin-top: 8px; box-shadow: var(--shadow);
 }
-.weightrow .lbl { color: var(--ink-soft); font-weight: 600; }
 .weightrow input {
-  width: 90px; font-size: 1.5rem; font-weight: 800; text-align: right;
+  width: 78px; font-size: 1.5rem; font-weight: 800; text-align: right;
   border: 0; background: none; outline: none;
 }
 .weightrow .unit { color: var(--ink-soft); font-weight: 600; }
-.weightrow .delta { margin-left: auto; color: var(--ink-soft); font-weight: 600; font-size: .95rem; }
-.weightrow .delta.down { color: var(--green); }
-.weightrow .delta.up { color: var(--amber); }
+.weightrow .delta { color: var(--ink-soft); font-weight: 600; font-size: .9rem; white-space: nowrap; }
+.weightrow .delta.good { color: var(--green); }
+.weightrow .delta.warn { color: var(--amber); }
+.weightrow .spacer { flex: 1; }
+.weightrow .steps { font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
+.weightrow .steps b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.syncbtn { padding: 6px; border-radius: 10px; color: var(--ink-soft); align-self: center; }
+.syncbtn:active { background: var(--track); }
+.syncbtn svg { width: 18px; height: 18px; display: block; }
+.syncbtn.spin svg { animation: glomspin 1s linear infinite; }
+@keyframes glomspin { to { transform: rotate(360deg); } }
 
 /* ---------- progress ---------- */
 .progress {
@@ -1189,10 +1222,15 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
   </header>
 
   <div class="weightrow">
-    <span class="lbl">weight</span>
     <input id="weightIn" type="number" inputmode="decimal" step="0.1" min="20" max="400" placeholder="—">
     <span class="unit">kg</span>
     <span class="delta" id="weightDelta"></span>
+    <span class="spacer"></span>
+    <span class="steps">&#128095; <b id="stepsNum">—</b></span>
+    <span class="delta" id="stepsDelta"></span>
+    <button class="syncbtn" id="wSync" aria-label="Sync from Withings" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
   </div>
 
   <div class="progress">
@@ -1415,9 +1453,19 @@ const App = {
     const delta = el('weightDelta');
     if (day.weight != null && day.prev_weight != null) {
       const diff = day.weight - day.prev_weight;
-      delta.textContent = (diff <= 0 ? '▾ ' : '▴ ') + this.fmt(Math.abs(diff));
-      delta.className = 'delta ' + (diff <= 0 ? 'down' : 'up');
+      delta.textContent = (diff <= 0 ? '▾ ' : '▴ ') + Math.abs(diff).toFixed(1);
+      delta.className = 'delta ' + (diff <= 0 ? 'good' : 'warn'); // losing weight reads green
     } else { delta.textContent = ''; delta.className = 'delta'; }
+
+    el('stepsNum').textContent = day.steps != null ? day.steps.toLocaleString() : '—';
+    const sDelta = el('stepsDelta');
+    if (day.steps != null && day.prev_steps != null) {
+      const sd = day.steps - day.prev_steps;
+      sDelta.textContent = (sd >= 0 ? '▴ ' : '▾ ') + Math.abs(sd).toLocaleString();
+      sDelta.className = 'delta ' + (sd >= 0 ? 'good' : 'warn'); // more steps reads green
+    } else { sDelta.textContent = ''; sDelta.className = 'delta'; }
+
+    el('wSync').hidden = day.withings !== 'connected';
 
     const { totals, targets } = day;
 
@@ -1935,6 +1983,19 @@ document.getElementById('weightIn').addEventListener('change', async (e) => {
   if (e.target.validity.badInput) return; // rejected keystrokes read as '', which would delete the weight
   await App.api('weight.set', { day: App.state.date, kg: e.target.value });
   App.load(App.state.date);
+});
+
+document.getElementById('wSync').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  if (btn.classList.contains('spin')) return;
+  btn.classList.add('spin');
+  try {
+    const res = await App.api('withings.sync', {});
+    App.toast(res.synced > 0 ? 'Synced ' + res.synced + ' from Withings' : 'Nothing new at Withings');
+    await App.load(App.state.date);
+  } finally {
+    btn.classList.remove('spin');
+  }
 });
 
 // A PWA resumed after midnight would otherwise keep logging to the stale "today"
