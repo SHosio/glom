@@ -43,6 +43,11 @@ defined('GLOM_WITHINGS_SECRET')    || define('GLOM_WITHINGS_SECRET', '');
 const GLOM_WITHINGS_API       = 'https://wbsapi.withings.net';
 const GLOM_WITHINGS_AUTHORIZE = 'https://account.withings.com/oauth2_user/authorize2';
 
+// Optional label scanning: an OpenRouter API key enables the camera buttons.
+defined('GLOM_OPENROUTER_KEY')  || define('GLOM_OPENROUTER_KEY', '');
+defined('GLOM_VISION_MODEL')    || define('GLOM_VISION_MODEL', 'google/gemini-2.5-flash');
+const GLOM_OPENROUTER_API = 'https://openrouter.ai/api/v1/chat/completions';
+
 date_default_timezone_set(GLOM_TZ);
 
 // App icon PNGs (base64), served at ?asset=icon&size=192|512
@@ -222,10 +227,31 @@ function app_url(): string {
     return ($https ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . ($_SERVER['SCRIPT_NAME'] ?? '/index.php');
 }
 
+/** POST a JSON payload, return decoded JSON array or null. */
+function http_post_json(string $url, array $payload, ?string $bearer = null, int $timeout = 60): ?array {
+    return http_raw_post($url, json_encode($payload), 'application/json', $bearer, $timeout);
+}
+
+/** GET a JSON document, return decoded array or null. */
+function http_get_json(string $url, int $timeout = 10): ?array {
+    $ctx = stream_context_create(['http' => [
+        'header' => 'User-Agent: glom/0.2 (personal nutrition tracker)',
+        'timeout' => $timeout,
+        'ignore_errors' => true,
+    ]]);
+    $resp = @file_get_contents($url, false, $ctx);
+    if (!is_string($resp)) return null;
+    $data = json_decode($resp, true);
+    return is_array($data) ? $data : null;
+}
+
 /** POST form fields, return decoded JSON array or null. Uses curl when available. */
 function http_post_form(string $url, array $fields, ?string $bearer = null): ?array {
-    $body = http_build_query($fields);
-    $headers = ['Content-Type: application/x-www-form-urlencoded'];
+    return http_raw_post($url, http_build_query($fields), 'application/x-www-form-urlencoded', $bearer, 15);
+}
+
+function http_raw_post(string $url, string $body, string $contentType, ?string $bearer, int $timeout): ?array {
+    $headers = ['Content-Type: ' . $contentType];
     if ($bearer !== null) $headers[] = 'Authorization: Bearer ' . $bearer;
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
@@ -234,7 +260,7 @@ function http_post_form(string $url, array $fields, ?string $bearer = null): ?ar
             CURLOPT_POSTFIELDS => $body,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 15,
+            CURLOPT_TIMEOUT => $timeout,
         ]);
         $resp = curl_exec($ch);
     } else {
@@ -242,7 +268,7 @@ function http_post_form(string $url, array $fields, ?string $bearer = null): ?ar
             'method' => 'POST',
             'header' => implode("\r\n", $headers),
             'content' => $body,
-            'timeout' => 15,
+            'timeout' => $timeout,
             'ignore_errors' => true,
         ]]));
     }
@@ -743,6 +769,88 @@ function api(string $action): never {
             json_out(['ok' => true, 'pass' => $pass, 'missing_tables' => $missing, 'meal_math' => $mathOk]);
         }
 
+        case 'scan': {
+            require_post();
+            if (GLOM_OPENROUTER_KEY === '') fail('scanning not configured');
+            $b = body();
+            $kind = ($b['kind'] ?? '') === 'meal' ? 'meal' : 'food';
+            $images = $b['images'] ?? null;
+            if (!is_array($images) || $images === [] || count($images) > 2) fail('send 1 or 2 images');
+            $content = [];
+            foreach ($images as $img) {
+                if (!is_string($img) || !preg_match('#^data:image/(jpeg|png|webp);base64,#', $img)
+                    || strlen($img) > 4_000_000) {
+                    fail('invalid image');
+                }
+                $content[] = ['type' => 'image_url', 'image_url' => ['url' => $img]];
+            }
+            $barcodeNote = ' Also: if a product barcode is visible, read the digits printed under it into "barcode" (string), else null.';
+            $prompt = ($kind === 'food'
+                ? 'These photos show a food product and/or its nutrition label. Extract the product name '
+                  . '(short, as a person would call the food), the kcal per 100 g, and the protein grams per 100 g. '
+                  . 'If values are given per serving only and the serving size in grams is stated, convert to per 100 g. '
+                  . 'Reply with ONLY a JSON object, no markdown: '
+                  . '{"name": string|null, "kcal_per_100g": number|null, "protein_per_100g": number|null, "barcode": string|null}. '
+                  . 'Use null for anything you cannot read confidently.'
+                : 'These photos show a meal or ready-to-eat product and/or its nutrition label. Extract a short name '
+                  . 'and the TOTAL kcal and TOTAL protein grams for the whole portion or package shown. '
+                  . 'Prefer per-portion or per-package values; if only per-100 g values and a net weight are visible, '
+                  . 'multiply them out. Reply with ONLY a JSON object, no markdown: '
+                  . '{"name": string|null, "kcal": number|null, "protein": number|null, "barcode": string|null}. '
+                  . 'Use null for anything you cannot read confidently.') . $barcodeNote;
+            $content[] = ['type' => 'text', 'text' => $prompt];
+            $resp = http_post_json(GLOM_OPENROUTER_API, [
+                'model' => GLOM_VISION_MODEL,
+                'messages' => [['role' => 'user', 'content' => $content]],
+                'temperature' => 0,
+            ], GLOM_OPENROUTER_KEY);
+            $text = $resp['choices'][0]['message']['content'] ?? null;
+            if (!is_string($text)) {
+                fail('vision model unavailable: ' . ($resp['error']['message'] ?? 'no response'), 502);
+            }
+            // Models sometimes wrap JSON in fences despite instructions; strip and parse leniently.
+            if (preg_match('/\{.*\}/s', $text, $m)) $text = $m[0];
+            $data = json_decode($text, true);
+            if (!is_array($data)) fail('could not read the label, try a sharper photo', 422);
+            $numOrNull = fn($v) => is_numeric($v) && $v >= 0 && $v <= 20000 ? round((float)$v, 1) : null;
+            $out = ['ok' => true, 'kind' => $kind, 'source' => 'label',
+                    'name' => is_string($data['name'] ?? null) ? mb_substr(trim($data['name']), 0, 80) : null];
+            if ($kind === 'food') {
+                $out['kcal_per_100g']    = $numOrNull($data['kcal_per_100g'] ?? null);
+                $out['protein_per_100g'] = $numOrNull($data['protein_per_100g'] ?? null);
+            } else {
+                $out['kcal']    = $numOrNull($data['kcal'] ?? null);
+                $out['protein'] = $numOrNull($data['protein'] ?? null);
+            }
+            // A readable barcode beats OCR: exact data from Open Food Facts when the product is known.
+            $barcode = $data['barcode'] ?? null;
+            if (is_string($barcode) && preg_match('/^\d{8,14}$/', $barcode = preg_replace('/\s+/', '', $barcode))) {
+                $off = http_get_json('https://world.openfoodfacts.org/api/v2/product/'
+                    . $barcode . '.json?fields=product_name,quantity,nutriments');
+                $p = ($off['status'] ?? 0) === 1 ? ($off['product'] ?? []) : [];
+                $kcal100 = $numOrNull($p['nutriments']['energy-kcal_100g'] ?? null);
+                $prot100 = $numOrNull($p['nutriments']['proteins_100g'] ?? null);
+                if ($kcal100 !== null) {
+                    $out['source'] = 'openfoodfacts';
+                    $out['barcode'] = $barcode;
+                    if (is_string($p['product_name'] ?? null) && trim($p['product_name']) !== '') {
+                        $out['name'] = mb_substr(trim($p['product_name']), 0, 80);
+                    }
+                    if ($kind === 'food') {
+                        $out['kcal_per_100g']    = $kcal100;
+                        $out['protein_per_100g'] = $prot100 ?? $out['protein_per_100g'];
+                    } elseif (preg_match('/([\d.,]+)\s*(k?g)\b/i', (string)($p['quantity'] ?? ''), $q)) {
+                        $grams = (float)str_replace(',', '.', $q[1]) * (strtolower($q[2]) === 'kg' ? 1000 : 1);
+                        if ($grams >= 10 && $grams <= 5000) {
+                            $out['kcal']    = round($kcal100 * $grams / 100, 1);
+                            $out['protein'] = $prot100 !== null ? round($prot100 * $grams / 100, 1) : $out['protein'];
+                        }
+                    }
+                }
+            }
+            json_out($out);
+        }
+
         case 'withings.connect': {
             if (GLOM_WITHINGS_CLIENT_ID === '') fail('Withings API keys not configured');
             $state = bin2hex(random_bytes(16));
@@ -1176,6 +1284,8 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 .mgr-form .itemrow { display: flex; gap: 6px; align-items: center; }
 .mgr-form .itemrow .rm { color: var(--red); font-weight: 800; padding: 4px 8px; }
 .mgr-form .switch { color: var(--green-deep); font-weight: 700; font-size: .85rem; text-align: left; }
+.mgr-form .scanbtn.busy { opacity: .5; pointer-events: none; animation: glompulse 1.2s ease-in-out infinite; }
+@keyframes glompulse { 50% { opacity: .25; } }
 .mgr-form .total { font-weight: 800; text-align: right; }
 .btnrow { display: flex; gap: 8px; margin-top: 4px; }
 .btn-primary { background: var(--green); color: #fff; font-weight: 800; border-radius: 10px; padding: 10px 18px; flex: 1; }
@@ -1324,6 +1434,8 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
     </div>
   </div>
 
+  <input type="file" id="scanFile" accept="image/*" multiple hidden>
+
   <div class="overlay" id="overlay"></div>
 
   <div class="panel" id="bookPanel">
@@ -1337,6 +1449,9 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
       <div class="mgr-list" id="mgrFoodList"></div>
       <form class="mgr-form" id="foodForm">
         <input type="hidden" id="ffId">
+        <?php if (GLOM_OPENROUTER_KEY !== ''): ?>
+        <button class="switch scanbtn" type="button" id="ffScan">&#128247; Scan label (photo or gallery, up to 2)</button>
+        <?php endif; ?>
         <input id="ffName" type="text" maxlength="80" placeholder="Food name" required>
         <div class="row">
           <input id="ffKcal" type="number" inputmode="decimal" min="0" step="0.1" placeholder="kcal / 100 g" required>
@@ -1352,6 +1467,9 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
       <div class="mgr-list" id="mgrMealList"></div>
       <form class="mgr-form" id="mealForm">
         <input type="hidden" id="mfId">
+        <?php if (GLOM_OPENROUTER_KEY !== ''): ?>
+        <button class="switch scanbtn" type="button" id="mfScan">&#128247; Scan package (photo or gallery, up to 2)</button>
+        <?php endif; ?>
         <input id="mfName" type="text" maxlength="80" placeholder="Meal name (e.g. glob)" required>
         <div id="mfItems"></div>
         <button class="switch" type="button" id="mfAddFoodItem">+ favourite food</button>
@@ -1400,14 +1518,17 @@ const App = {
       r = await fetch('index.php?api=' + action, opts);
     } catch {
       this.toast('offline, not saved');
-      throw new Error('offline');
+      throw Object.assign(new Error('offline'), { handled: true });
     }
     if (r.status === 401) {
       if (!this._reloading) { this._reloading = true; location.reload(); }
-      throw new Error('unauthorized');
+      throw Object.assign(new Error('unauthorized'), { handled: true });
     }
     const d = await r.json();
-    if (!d.ok) { this.toast(d.error || 'error'); throw new Error(d.error); }
+    if (!d.ok) {
+      this.toast(d.error || 'error');
+      throw Object.assign(new Error(d.error), { handled: true });
+    }
     return d;
   },
 
@@ -1895,6 +2016,51 @@ const App = {
     document.getElementById('mfCancel').hidden = false;
   },
 
+  // ---------- label scanning ----------
+
+  async scanImagesToDataUrls(files) {
+    const urls = [];
+    for (const f of [...files].slice(0, 2)) {
+      const bmp = await createImageBitmap(f);
+      const scale = Math.min(1, 1024 / Math.max(bmp.width, bmp.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(bmp.width * scale);
+      canvas.height = Math.round(bmp.height * scale);
+      canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      urls.push(canvas.toDataURL('image/jpeg', 0.85));
+      bmp.close();
+    }
+    return urls;
+  },
+
+  async scan(kind, files, btn) {
+    btn.classList.add('busy');
+    try {
+      const images = await this.scanImagesToDataUrls(files);
+      const res = await this.api('scan', { kind, images });
+      if (kind === 'food') {
+        if (res.name != null) document.getElementById('ffName').value = res.name;
+        if (res.kcal_per_100g != null) document.getElementById('ffKcal').value = res.kcal_per_100g;
+        if (res.protein_per_100g != null) document.getElementById('ffProtein').value = res.protein_per_100g;
+        const missed = [res.name, res.kcal_per_100g, res.protein_per_100g].filter(v => v == null).length;
+        this.toast(res.source === 'openfoodfacts' ? 'Found by barcode, check and save'
+          : missed ? 'Read the label, ' + missed + ' field(s) need you' : 'Label read, check and save');
+      } else {
+        if (res.name != null) document.getElementById('mfName').value = res.name;
+        if (res.kcal != null || res.protein != null) {
+          this.mealItemRow('raw', { raw_label: 'from label', raw_kcal: res.kcal ?? '', raw_protein: res.protein ?? '' });
+          this.toast(res.source === 'openfoodfacts' ? 'Found by barcode, check and save' : 'Label read, check and save');
+        } else {
+          this.toast('Could not read totals, add them by hand');
+        }
+      }
+    } catch (err) {
+      if (!err.handled) this.toast('scan failed'); // api() toasts its own errors
+    } finally {
+      btn.classList.remove('busy');
+    }
+  },
+
   resetFoodForm() {
     document.getElementById('foodForm').reset();
     document.getElementById('ffId').value = '';
@@ -2100,6 +2266,17 @@ document.getElementById('foodForm').addEventListener('submit', async (e) => {
   App.renderMgr();
 });
 document.getElementById('ffCancel').addEventListener('click', () => App.resetFoodForm());
+
+const scanFile = document.getElementById('scanFile');
+let scanTarget = null;
+for (const [btnId, kind] of [['ffScan', 'food'], ['mfScan', 'meal']]) {
+  const btn = document.getElementById(btnId);
+  if (!btn) continue; // scanning not configured
+  btn.addEventListener('click', () => { scanTarget = { kind, btn }; scanFile.value = ''; scanFile.click(); });
+}
+scanFile.addEventListener('change', () => {
+  if (scanTarget && scanFile.files.length) App.scan(scanTarget.kind, scanFile.files, scanTarget.btn);
+});
 
 document.getElementById('mfAddFoodItem').addEventListener('click', () => App.mealItemRow('food'));
 document.getElementById('mfAddRawItem').addEventListener('click', () => App.mealItemRow('raw'));
