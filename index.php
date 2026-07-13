@@ -110,10 +110,6 @@ function db(): PDO {
                 kg     REAL NOT NULL,
                 source TEXT NOT NULL DEFAULT 'manual'
             );
-            CREATE TABLE IF NOT EXISTS steps (
-                day   TEXT PRIMARY KEY,
-                count INTEGER NOT NULL
-            );
             SQL);
         // Migration for databases created before v0.3: weights gained a source column.
         try {
@@ -121,6 +117,8 @@ function db(): PDO {
         } catch (PDOException) {
             // column already exists
         }
+        // Steps tracking was removed in v0.5; shed the table from older databases.
+        $pdo->exec('DROP TABLE IF EXISTS steps');
     }
     return $pdo;
 }
@@ -316,9 +314,9 @@ function withings_access_token(): ?string {
     return setting('withings_access_token');
 }
 
-/** Pull weight and steps since last sync, upsert them, return per-metric counts. */
+/** Pull weight since last sync, upsert it, return the count. */
 function withings_sync(bool $full = false, bool $debug = false): array {
-    $out = ['weights' => 0, 'steps' => 0, 'getmeas_status' => null, 'getactivity_status' => null, 'activity_days' => 0];
+    $out = ['weights' => 0, 'getmeas_status' => null];
     $token = withings_access_token();
     if ($token === null) return $out;
     $since = $full ? 0 : (int)(setting('withings_last_sync') ?? 0);
@@ -330,6 +328,7 @@ function withings_sync(bool $full = false, bool $debug = false): array {
         'lastupdate' => $since,
     ], $token);
     $out['getmeas_status'] = $resp['status'] ?? null;
+    if ($debug) $out['debug'] = ['getmeas_response' => $resp];
     if (($resp['status'] ?? -1) !== 0) return $out;
     try {
         // Withings reports the account's timezone; weigh-ins happen in that local day.
@@ -354,34 +353,6 @@ function withings_sync(bool $full = false, bool $debug = false): array {
                 ->setTimezone($tz)->format('Y-m-d');
             $st->execute([$day, $kg]);
             $out['weights']++;
-        }
-    }
-    // Steps come from the activity API (phone-tracked steps in Health Mate count too).
-    // Date-range form rather than lastupdate: activity days get rewritten all day long,
-    // and we always want the current totals for the recent window.
-    $actReq = [
-        'action'       => 'getactivity',
-        'data_fields'  => 'steps',
-        'startdateymd' => (new DateTimeImmutable('@' . $since))->setTimezone($tz)->format('Y-m-d'),
-        'enddateymd'   => (new DateTimeImmutable('now', $tz))->format('Y-m-d'),
-    ];
-    $act = http_post_form(GLOM_WITHINGS_API . '/v2/measure', $actReq, $token);
-    $out['getactivity_status'] = $act['status'] ?? null;
-    if ($debug) {
-        $out['debug'] = ['getactivity_request' => $actReq, 'getactivity_response' => $act];
-    }
-    if (($act['status'] ?? -1) === 0) {
-        $acts = $act['body']['activities'] ?? [];
-        $out['activity_days'] = count($acts);
-        $sSt = db()->prepare('INSERT INTO steps (day, count) VALUES (?, ?)
-                              ON CONFLICT(day) DO UPDATE SET count = excluded.count');
-        foreach ($acts as $a) {
-            $d = (string)($a['date'] ?? '');
-            $n = $a['steps'] ?? null;
-            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) && is_numeric($n) && $n >= 0 && $n <= 500000) {
-                $sSt->execute([$d, (int)$n]);
-                $out['steps']++;
-            }
         }
     }
     setting_set('withings_last_sync', (string)((int)($resp['body']['updatetime'] ?? time())));
@@ -699,19 +670,11 @@ function api(string $action): never {
             $st = $db->prepare('SELECT kg FROM weights WHERE day < ? ORDER BY day DESC LIMIT 1');
             $st->execute([$date]);
             $prev = $st->fetchColumn();
-            $st = $db->prepare('SELECT count FROM steps WHERE day = ?');
-            $st->execute([$date]);
-            $steps = $st->fetchColumn();
-            $st = $db->prepare('SELECT count FROM steps WHERE day < ? ORDER BY day DESC LIMIT 1');
-            $st->execute([$date]);
-            $prevSteps = $st->fetchColumn();
             json_out([
                 'ok' => true, 'date' => $date, 'today' => today(),
                 'entries' => $entries,
                 'weight' => $weight === false ? null : (float)$weight,
                 'prev_weight' => $prev === false ? null : (float)$prev,
-                'steps' => $steps === false ? null : (int)$steps,
-                'prev_steps' => $prevSteps === false ? null : (int)$prevSteps,
                 'totals' => $totals,
                 'targets' => get_targets(),
                 'withings' => withings_status(),
@@ -749,7 +712,7 @@ function api(string $action): never {
         case 'selftest': {
             $tables = db()->query("SELECT name FROM sqlite_master WHERE type = 'table'")
                           ->fetchAll(PDO::FETCH_COLUMN);
-            $expected = ['settings', 'foods', 'meals', 'meal_items', 'entries', 'weights', 'steps'];
+            $expected = ['settings', 'foods', 'meals', 'meal_items', 'entries', 'weights'];
             $missing = array_values(array_diff($expected, $tables));
             $db = db();
             $db->beginTransaction();
@@ -792,12 +755,15 @@ function api(string $action): never {
                   . 'Reply with ONLY a JSON object, no markdown: '
                   . '{"name": string|null, "kcal_per_100g": number|null, "protein_per_100g": number|null, "barcode": string|null}. '
                   . 'Use null for anything you cannot read confidently.'
-                : 'These photos show a meal or ready-to-eat product and/or its nutrition label. Extract a short name '
-                  . 'and the TOTAL kcal and TOTAL protein grams for the whole portion or package shown. '
-                  . 'Prefer per-portion or per-package values; if only per-100 g values and a net weight are visible, '
-                  . 'multiply them out. Reply with ONLY a JSON object, no markdown: '
-                  . '{"name": string|null, "kcal": number|null, "protein": number|null, "barcode": string|null}. '
-                  . 'Use null for anything you cannot read confidently.') . $barcodeNote;
+                : 'These photos show a meal, a ready-to-eat product, its nutrition label, or plain food. '
+                  . 'Extract a short name and the TOTAL kcal and TOTAL protein grams for the whole portion '
+                  . 'or package shown. Prefer per-portion or per-package values; if only per-100 g values and '
+                  . 'a net weight are visible, multiply them out. If no nutrition label or packaging text is '
+                  . 'readable, ESTIMATE the totals for the visible portion from its appearance and typical '
+                  . 'composition, and set "estimated" to true. Reply with ONLY a JSON object, no markdown: '
+                  . '{"name": string|null, "kcal": number|null, "protein": number|null, '
+                  . '"estimated": boolean, "barcode": string|null}. '
+                  . 'Use null for values you can neither read nor estimate.') . $barcodeNote;
             $content[] = ['type' => 'text', 'text' => $prompt];
             $resp = http_post_json(GLOM_OPENROUTER_API, [
                 'model' => GLOM_VISION_MODEL,
@@ -819,8 +785,9 @@ function api(string $action): never {
                 $out['kcal_per_100g']    = $numOrNull($data['kcal_per_100g'] ?? null);
                 $out['protein_per_100g'] = $numOrNull($data['protein_per_100g'] ?? null);
             } else {
-                $out['kcal']    = $numOrNull($data['kcal'] ?? null);
-                $out['protein'] = $numOrNull($data['protein'] ?? null);
+                $out['kcal']      = $numOrNull($data['kcal'] ?? null);
+                $out['protein']   = $numOrNull($data['protein'] ?? null);
+                $out['estimated'] = !empty($data['estimated']);
             }
             // A readable barcode beats OCR: exact data from Open Food Facts when the product is known.
             $barcode = $data['barcode'] ?? null;
@@ -842,8 +809,9 @@ function api(string $action): never {
                     } elseif (preg_match('/([\d.,]+)\s*(k?g)\b/i', (string)($p['quantity'] ?? ''), $q)) {
                         $grams = (float)str_replace(',', '.', $q[1]) * (strtolower($q[2]) === 'kg' ? 1000 : 1);
                         if ($grams >= 10 && $grams <= 5000) {
-                            $out['kcal']    = round($kcal100 * $grams / 100, 1);
-                            $out['protein'] = $prot100 !== null ? round($prot100 * $grams / 100, 1) : $out['protein'];
+                            $out['kcal']      = round($kcal100 * $grams / 100, 1);
+                            $out['protein']   = $prot100 !== null ? round($prot100 * $grams / 100, 1) : $out['protein'];
+                            $out['estimated'] = false;
                         }
                     }
                 }
@@ -858,7 +826,7 @@ function api(string $action): never {
             header('Location: ' . GLOM_WITHINGS_AUTHORIZE . '?' . http_build_query([
                 'response_type' => 'code',
                 'client_id'     => GLOM_WITHINGS_CLIENT_ID,
-                'scope'         => 'user.metrics,user.activity', // weight + steps
+                'scope'         => 'user.metrics', // weight
                 'redirect_uri'  => app_url(),
                 'state'         => $state,
             ]));
@@ -868,7 +836,7 @@ function api(string $action): never {
         case 'withings.sync': {
             require_post();
             if (withings_status() !== 'connected') {
-                json_out(['ok' => true, 'connected' => false, 'weights' => 0, 'steps' => 0]);
+                json_out(['ok' => true, 'connected' => false, 'weights' => 0]);
             }
             $r = withings_sync(!empty(body()['full']), !empty(body()['debug']));
             json_out(['ok' => true, 'connected' => withings_status() === 'connected'] + $r);
@@ -892,8 +860,6 @@ function api(string $action): never {
             $wSt = db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'ingest')
                                   ON CONFLICT(day) DO UPDATE SET kg = excluded.kg
                                   WHERE weights.source != 'manual'");
-            $sSt = db()->prepare('INSERT INTO steps (day, count) VALUES (?, ?)
-                                  ON CONFLICT(day) DO UPDATE SET count = excluded.count');
             foreach ($rows as $r) {
                 $date  = is_array($r) ? (string)($r['date'] ?? '') : '';
                 $value = is_array($r) ? ($r['value'] ?? null) : null;
@@ -902,9 +868,6 @@ function api(string $action): never {
                       && is_numeric($value);
                 if ($ok && ($r['metric'] ?? '') === 'weight' && $value >= 20 && $value <= 400) {
                     $wSt->execute([$date, (float)$value]);
-                    $written++;
-                } elseif ($ok && ($r['metric'] ?? '') === 'steps' && $value >= 0 && $value <= 500000) {
-                    $sSt->execute([$date, (int)$value]);
                     $written++;
                 } else {
                     $skipped++;
@@ -1135,8 +1098,6 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 .weightrow .delta.good { color: var(--green); }
 .weightrow .delta.warn { color: var(--amber); }
 .weightrow .spacer { flex: 1; }
-.weightrow .steps { font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
-.weightrow .steps b { color: var(--ink); font-variant-numeric: tabular-nums; }
 .syncbtn { padding: 6px; border-radius: 10px; color: var(--ink-soft); align-self: center; }
 .syncbtn:active { background: var(--track); }
 .syncbtn svg { width: 18px; height: 18px; display: block; }
@@ -1202,9 +1163,15 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 }
 #addbar .inner { max-width: 480px; margin: 0 auto; padding: 8px 16px 10px; }
 #chips {
-  display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px;
+  display: flex; gap: 8px; overflow-x: auto;
+  margin: 0 -16px; padding: 2px 16px 8px; /* bleed to the screen edge so clipped pills read as scrollable */
   scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  --fadeL: 0px; --fadeR: 0px;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 var(--fadeL), #000 calc(100% - var(--fadeR)), transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 var(--fadeL), #000 calc(100% - var(--fadeR)), transparent);
 }
+#chips.fadeL { --fadeL: 36px; }
+#chips.fadeR { --fadeR: 36px; }
 #chips::-webkit-scrollbar { display: none; }
 .chip {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
@@ -1283,8 +1250,9 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 .mgr-form input:focus { border-color: var(--green); }
 .mgr-form .itemrow { display: flex; gap: 6px; align-items: center; }
 .mgr-form .itemrow .rm { color: var(--red); font-weight: 800; padding: 4px 8px; }
-.mgr-form .switch { color: var(--green-deep); font-weight: 700; font-size: .85rem; text-align: left; }
-.mgr-form .scanbtn.busy { opacity: .5; pointer-events: none; animation: glompulse 1.2s ease-in-out infinite; }
+.mgr-form .switch, .pane .switch { color: var(--green-deep); font-weight: 700; font-size: .85rem; text-align: left; }
+.scanbtn.busy { opacity: .5; pointer-events: none; animation: glompulse 1.2s ease-in-out infinite; }
+.pane .scanbtn { display: block; margin-bottom: 8px; }
 @keyframes glompulse { 50% { opacity: .25; } }
 .mgr-form .total { font-weight: 800; text-align: right; }
 .btnrow { display: flex; gap: 8px; margin-top: 4px; }
@@ -1360,8 +1328,6 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
     <span class="unit">kg</span>
     <span class="delta" id="weightDelta"></span>
     <span class="spacer"></span>
-    <span class="steps">&#128095; <b id="stepsNum">—</b></span>
-    <span class="delta" id="stepsDelta"></span>
     <button class="syncbtn" id="wSync" aria-label="Sync from Withings" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
     </button>
@@ -1424,6 +1390,9 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
         <div class="picklist" id="mealList"></div>
       </div>
       <div class="pane" id="paneQuick" hidden>
+        <?php if (GLOM_OPENROUTER_KEY !== ''): ?>
+        <button class="switch scanbtn" type="button" id="qkScan">&#128247; Snap the label or the food itself</button>
+        <?php endif; ?>
         <div class="row">
           <input id="quickKcal" type="number" inputmode="decimal" min="0" max="20000" placeholder="kcal" style="width:86px">
           <input id="quickProtein" type="number" inputmode="decimal" min="0" max="1000" placeholder="protein g" style="width:100px">
@@ -1556,7 +1525,7 @@ const App = {
     if (localStorage.getItem('glom_wsync') === today) return;
     localStorage.setItem('glom_wsync', today);
     this.api('withings.sync', {}).then((res) => {
-      if (res.weights > 0 || res.steps > 0) {
+      if (res.weights > 0) {
         this.toast(this.syncMsg(res));
         this.load(this.state.date);
       }
@@ -1564,10 +1533,7 @@ const App = {
   },
 
   syncMsg(res) {
-    const parts = [];
-    if (res.weights > 0) parts.push('weight');
-    if (res.steps > 0) parts.push('steps');
-    return parts.length ? 'Synced ' + parts.join(' + ') + ' from Withings' : 'Nothing new at Withings';
+    return res.weights > 0 ? 'Synced weight from Withings' : 'Nothing new at Withings';
   },
 
   fmt(n) { return Number(n) % 1 === 0 ? String(Number(n)) : Number(n).toFixed(1); },
@@ -1608,14 +1574,6 @@ const App = {
       delta.textContent = (diff <= 0 ? '▾ ' : '▴ ') + Math.abs(diff).toFixed(1);
       delta.className = 'delta ' + (diff <= 0 ? 'good' : 'warn'); // losing weight reads green
     } else { delta.textContent = ''; delta.className = 'delta'; }
-
-    el('stepsNum').textContent = day.steps != null ? day.steps.toLocaleString() : '—';
-    const sDelta = el('stepsDelta');
-    if (day.steps != null && day.prev_steps != null) {
-      const sd = day.steps - day.prev_steps;
-      sDelta.textContent = (sd >= 0 ? '▴ ' : '▾ ') + Math.abs(sd).toLocaleString();
-      sDelta.className = 'delta ' + (sd >= 0 ? 'good' : 'warn'); // more steps reads green
-    } else { sDelta.textContent = ''; sDelta.className = 'delta'; }
 
     el('wSync').hidden = day.withings !== 'connected';
 
@@ -1738,6 +1696,14 @@ const App = {
       chips.appendChild(c);
     }
     chips.hidden = cands.length === 0;
+    this.chipFades();
+  },
+
+  chipFades() {
+    const c = document.getElementById('chips');
+    const max = c.scrollWidth - c.clientWidth;
+    c.classList.toggle('fadeL', c.scrollLeft > 4);
+    c.classList.toggle('fadeR', c.scrollLeft < max - 4);
   },
 
   pickFood(food, switchTab) {
@@ -2037,7 +2003,8 @@ const App = {
     btn.classList.add('busy');
     try {
       const images = await this.scanImagesToDataUrls(files);
-      const res = await this.api('scan', { kind, images });
+      // The quick tab wants the same whole-portion totals the meal editor gets.
+      const res = await this.api('scan', { kind: kind === 'quick' ? 'meal' : kind, images });
       if (kind === 'food') {
         if (res.name != null) document.getElementById('ffName').value = res.name;
         if (res.kcal_per_100g != null) document.getElementById('ffKcal').value = res.kcal_per_100g;
@@ -2045,11 +2012,24 @@ const App = {
         const missed = [res.name, res.kcal_per_100g, res.protein_per_100g].filter(v => v == null).length;
         this.toast(res.source === 'openfoodfacts' ? 'Found by barcode, check and save'
           : missed ? 'Read the label, ' + missed + ' field(s) need you' : 'Label read, check and save');
+      } else if (kind === 'quick') {
+        if (res.kcal == null && res.protein == null) {
+          this.toast('Could not read or guess totals, type them in');
+        } else {
+          if (res.kcal != null) document.getElementById('quickKcal').value = res.kcal;
+          if (res.protein != null) document.getElementById('quickProtein').value = res.protein;
+          if (res.name != null) {
+            document.getElementById('quickLabel').value = res.name + (res.estimated ? ' (guess)' : '');
+          }
+          this.toast(res.estimated ? 'Estimated from the photo, check before adding'
+            : res.source === 'openfoodfacts' ? 'Found by barcode, check and add' : 'Label read, check and add');
+        }
       } else {
         if (res.name != null) document.getElementById('mfName').value = res.name;
         if (res.kcal != null || res.protein != null) {
-          this.mealItemRow('raw', { raw_label: 'from label', raw_kcal: res.kcal ?? '', raw_protein: res.protein ?? '' });
-          this.toast(res.source === 'openfoodfacts' ? 'Found by barcode, check and save' : 'Label read, check and save');
+          this.mealItemRow('raw', { raw_label: res.estimated ? 'estimated' : 'from label', raw_kcal: res.kcal ?? '', raw_protein: res.protein ?? '' });
+          this.toast(res.estimated ? 'Estimated from the photo, check before saving'
+            : res.source === 'openfoodfacts' ? 'Found by barcode, check and save' : 'Label read, check and save');
         } else {
           this.toast('Could not read totals, add them by hand');
         }
@@ -2269,7 +2249,7 @@ document.getElementById('ffCancel').addEventListener('click', () => App.resetFoo
 
 const scanFile = document.getElementById('scanFile');
 let scanTarget = null;
-for (const [btnId, kind] of [['ffScan', 'food'], ['mfScan', 'meal']]) {
+for (const [btnId, kind] of [['ffScan', 'food'], ['mfScan', 'meal'], ['qkScan', 'quick']]) {
   const btn = document.getElementById(btnId);
   if (!btn) continue; // scanning not configured
   btn.addEventListener('click', () => { scanTarget = { kind, btn }; scanFile.value = ''; scanFile.click(); });
@@ -2277,6 +2257,16 @@ for (const [btnId, kind] of [['ffScan', 'food'], ['mfScan', 'meal']]) {
 scanFile.addEventListener('change', () => {
   if (scanTarget && scanFile.files.length) App.scan(scanTarget.kind, scanFile.files, scanTarget.btn);
 });
+
+const chipsEl = document.getElementById('chips');
+chipsEl.addEventListener('scroll', () => App.chipFades(), { passive: true });
+window.addEventListener('resize', () => App.chipFades());
+chipsEl.addEventListener('wheel', (e) => {
+  // mouse wheels only scroll vertically; steer that into the strip
+  if (chipsEl.scrollWidth <= chipsEl.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+  chipsEl.scrollLeft += e.deltaY;
+  e.preventDefault();
+}, { passive: false });
 
 document.getElementById('mfAddFoodItem').addEventListener('click', () => App.mealItemRow('food'));
 document.getElementById('mfAddRawItem').addEventListener('click', () => App.mealItemRow('raw'));
