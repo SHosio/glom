@@ -1085,9 +1085,14 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 
 /* ---------- weight ---------- */
 .weightrow {
-  display: flex; align-items: baseline; gap: 10px;
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
   background: var(--card); border: 1px solid var(--line); border-radius: 18px;
   padding: 12px 16px; margin-top: 8px; box-shadow: var(--shadow);
+}
+.weightrow .quote {
+  flex-basis: 100%; margin-top: 2px; padding: 0; text-align: left;
+  color: var(--ink-soft); font-size: .85rem; font-style: italic; font-weight: 600;
+  line-height: 1.35;
 }
 .weightrow input {
   width: 78px; font-size: 1.5rem; font-weight: 800; text-align: right;
@@ -1106,9 +1111,14 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 
 /* ---------- progress ---------- */
 .progress {
+  position: relative;
   background: var(--card); border: 1px solid var(--line); border-radius: 22px;
   padding: 18px 16px 16px; margin-top: 12px; box-shadow: var(--shadow);
 }
+.sharebtn { position: absolute; top: 4px; right: 4px; padding: 7px; border-radius: 10px; color: var(--ink-soft); }
+.sharebtn svg { width: 14px; height: 14px; display: block; }
+.sharebtn:active { background: var(--track); }
+@media (hover: hover) { .sharebtn { display: none; } } /* desktop screenshots itself */
 .meter + .meter { margin-top: 18px; }
 .meter .nums { display: flex; align-items: baseline; gap: 8px; }
 .meter .big { font-size: 2.4rem; font-weight: 800; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
@@ -1331,9 +1341,13 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
     <button class="syncbtn" id="wSync" aria-label="Sync from Withings" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
     </button>
+    <button class="quote" id="dailyQuote" type="button" aria-label="Daily quote, tap for another"></button>
   </div>
 
   <div class="progress">
+    <button class="sharebtn" id="shareBtn" aria-label="Copy today as image">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+    </button>
     <div class="meter kcal" id="kcalMeter">
       <div class="nums">
         <span class="big" id="kcalNow">0</span>
@@ -1477,6 +1491,38 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
   </div>
 </div>
 <script>
+// One per day, deterministic; tap the line for the next one.
+const QUOTES = [
+  'Nobody ever regretted logging the sandwich.',
+  'The scale measures gravity. The streak measures character.',
+  'Down a kilo is up a notch on every stair you’ll ever take.',
+  'Protein first. Regret never.',
+  'Today’s small deficit is next month’s smaller belt.',
+  'Hunger between meals is the sound of progress idling.',
+  'Your knees will thank you in writing.',
+  'Log it now, laugh about it later.',
+  'A boring day of eating is a thrilling day of losing.',
+  'The fork is the most-used gym equipment in the world.',
+  'Weigh-ins are weather. The trend is the climate.',
+  'Every gram of protein is a brick in the wall against the snack drawer.',
+  'Slow is smooth, and smooth is slim.',
+  'You’ve survived 100% of your hungry evenings so far.',
+  'Muscle stays on the guest list. Calories need an invitation.',
+  'One honest number beats ten flattering guesses.',
+  'The best sauce is a deficit.',
+  'Future you is already bragging about this.',
+  'Skipping the log never skipped the calories.',
+  'Lighter body, louder engine.',
+  'A logged treat is a treat. An unlogged treat is a debt.',
+  'Better sleep is one of the first things the deficit pays back.',
+  'Your heart pumps for free. Give it less to carry.',
+  'Averages don’t lie. They just wait.',
+  'Eat like someone is writing it down. Someone is. You.',
+  'Tomorrow’s weigh-in is tonight’s spoiler alert.',
+  'Cravings are loud. Trends are quiet. Bet on quiet.',
+  'Small plate, big year.',
+];
+
 const App = {
   state: { date: null, day: null, foods: [], meals: [], selFood: null },
 
@@ -1537,6 +1583,98 @@ const App = {
   },
 
   fmt(n) { return Number(n) % 1 === 0 ? String(Number(n)) : Number(n).toFixed(1); },
+
+  _quoteShift: 0,
+  renderQuote() {
+    const days = Math.floor(new Date(this.todayLocal() + 'T12:00:00').getTime() / 86400000);
+    const q = QUOTES[(days + this._quoteShift) % QUOTES.length];
+    document.getElementById('dailyQuote').textContent = '“' + q + '”';
+  },
+
+  // ---------- share card ----------
+
+  drawShareCard(day) {
+    const css = getComputedStyle(document.documentElement);
+    const v = (n) => css.getPropertyValue(n).trim();
+    const W = 1080, H = 900, pad = 56;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const x = c.getContext('2d');
+    const font = (spec) => { x.font = spec + ' -apple-system, system-ui, sans-serif'; };
+    x.fillStyle = v('--bg'); x.fillRect(0, 0, W, H);
+    x.fillStyle = v('--card');
+    x.beginPath(); x.roundRect(pad, pad, W - 2 * pad, H - 2 * pad, 44); x.fill();
+    x.strokeStyle = v('--line'); x.lineWidth = 2; x.stroke();
+    const L = pad + 60, R = W - pad - 60, bw = R - L;
+    const d = new Date(this.state.date + 'T12:00:00');
+    x.fillStyle = v('--ink-soft');
+    font('700 36px');
+    x.fillText(d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }), L, pad + 96);
+    const meter = (top, now, target, unit, color, showOver) => {
+      x.fillStyle = v('--ink');
+      font('800 96px');
+      const num = this.fmt(now);
+      x.fillText(num, L, top);
+      const numW = x.measureText(num).width;
+      x.fillStyle = v('--ink-soft');
+      font('600 40px');
+      x.fillText('/ ' + this.fmt(target) + ' ' + unit, L + numW + 24, top);
+      const bt = top + 36, bh = 30;
+      x.fillStyle = v('--track');
+      x.beginPath(); x.roundRect(L, bt, bw, bh, 999); x.fill();
+      const over = now > target && showOver;
+      const fillW = over ? bw * (target / now) : Math.min(bw, bw * (target > 0 ? now / target : 0));
+      if (now > 0) {
+        x.fillStyle = color;
+        x.beginPath(); x.roundRect(L, bt, Math.max(bh, fillW), bh, 999); x.fill();
+        if (over) {
+          x.fillStyle = v('--red');
+          x.beginPath(); x.roundRect(L + fillW + 4, bt, bw - fillW - 4, bh, 999); x.fill();
+        }
+      }
+    };
+    const { totals, targets } = day;
+    meter(pad + 268, totals.kcal, targets.kcal, 'kcal', v('--amber'), true);
+    // exceeding protein is a win, so the bar just fills deep green, mirroring the app
+    meter(pad + 500, totals.protein, targets.protein, 'g protein',
+      totals.protein >= targets.protein ? v('--green-deep') : v('--green'), false);
+    // quote footer, greedy wrap to two lines
+    x.fillStyle = v('--ink-soft');
+    font('italic 600 34px');
+    const words = document.getElementById('dailyQuote').textContent.split(' ');
+    const lines = [''];
+    for (const w of words) {
+      const probe = (lines[lines.length - 1] + ' ' + w).trim();
+      if (x.measureText(probe).width > bw - 160 && lines[lines.length - 1] !== '') lines.push(w);
+      else lines[lines.length - 1] = probe;
+    }
+    lines.slice(0, 2).forEach((ln, i) => x.fillText(ln, L, H - pad - 128 + i * 46));
+    x.fillStyle = v('--green');
+    font('800 48px');
+    x.textAlign = 'right';
+    x.fillText('glom', R, H - pad - 56);
+    x.textAlign = 'left';
+    return c;
+  },
+
+  async shareCard() {
+    if (!this.state.day) return;
+    const canvas = this.drawShareCard(this.state.day);
+    const blobP = new Promise((res) => canvas.toBlob(res, 'image/png'));
+    try {
+      // Promise form: Safari demands the write starts inside the tap gesture.
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blobP })]);
+      this.toast('Copied, go brag');
+    } catch {
+      try {
+        const file = new File([await blobP], 'glom.png', { type: 'image/png' });
+        if (!navigator.canShare?.({ files: [file] })) throw new Error('no share');
+        await navigator.share({ files: [file] });
+      } catch (e) {
+        if (e?.name !== 'AbortError') this.toast('Could not copy the image');
+      }
+    }
+  },
 
   dateLabel() {
     const { date } = this.state;
@@ -2315,7 +2453,11 @@ if (wq) {
   if (wq === 'connected') localStorage.removeItem('glom_wsync');
 }
 
+document.getElementById('dailyQuote').addEventListener('click', () => { App._quoteShift++; App.renderQuote(); });
+document.getElementById('shareBtn').addEventListener('click', () => App.shareCard());
+
 App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
+App.renderQuote();
 App.load();
 App.loadFavs();
 
