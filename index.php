@@ -337,12 +337,12 @@ function withings_sync(bool $full = false, bool $debug = false): array {
         $tz = new DateTimeZone(GLOM_TZ);
     }
     $grps = $resp['body']['measuregrps'] ?? [];
-    usort($grps, fn($a, $b) => ($a['date'] ?? 0) <=> ($b['date'] ?? 0));
-    // Groups are sorted ascending, so the day's LAST weigh-in ends up stored.
-    // Manual rows are never overwritten: what you type is the final word.
+    // The day's LOWEST weigh-in is what gets stored: this is a record book, so the
+    // best number of the day wins. Order no longer matters; each measure only lowers.
+    // Manual rows are never touched: what you type by hand is the final word.
     $st = db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'withings')
                          ON CONFLICT(day) DO UPDATE SET kg = excluded.kg
-                         WHERE weights.source != 'manual'");
+                         WHERE weights.source != 'manual' AND excluded.kg < weights.kg");
     foreach ($grps as $g) {
         if (($g['category'] ?? 0) !== 1) continue;
         foreach ($g['measures'] ?? [] as $m) {
@@ -857,9 +857,10 @@ function api(string $action): never {
             if (!is_array($rows)) fail('rows required (array of {date, metric, value})');
             $written = 0;
             $skipped = 0;
+            // Lowest of the day wins (record book); manual entries stay untouched.
             $wSt = db()->prepare("INSERT INTO weights (day, kg, source) VALUES (?, ?, 'ingest')
                                   ON CONFLICT(day) DO UPDATE SET kg = excluded.kg
-                                  WHERE weights.source != 'manual'");
+                                  WHERE weights.source != 'manual' AND excluded.kg < weights.kg");
             foreach ($rows as $r) {
                 $date  = is_array($r) ? (string)($r['date'] ?? '') : '';
                 $value = is_array($r) ? ($r['value'] ?? null) : null;
