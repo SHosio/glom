@@ -15,9 +15,15 @@
  *        <FilesMatch "^(glom\.sqlite|glom-config\.local\.php)">
  *          Require all denied
  *        </FilesMatch>
+ *        # the weekly backups also carry all your data:
+ *        RedirectMatch 404 ^/history/
  *
  *      nginx (inside the server block):
  *        location ~ /(glom\.sqlite|glom-config\.local\.php) { deny all; }
+ *        location ^~ /history/ { deny all; }
+ *
+ *      (glom also drops a deny-all .htaccess inside history/ on first backup,
+ *       so Apache hosts are covered even without the rule above.)
  *
  *   5. Open the URL, log in with your PIN, set targets, add your favourite foods.
  *
@@ -32,9 +38,10 @@
 defined('GLOM_PIN')       || define('GLOM_PIN', 'changeme');                 // login PIN
 defined('GLOM_SECRET')    || define('GLOM_SECRET', 'change-this-to-a-long-random-string'); // signs the auth cookie
 defined('GLOM_DB')        || define('GLOM_DB', __DIR__ . '/glom.sqlite');
+defined('GLOM_HISTORY')   || define('GLOM_HISTORY', __DIR__ . '/history');    // weekly DB backups land here
 defined('GLOM_TZ')        || define('GLOM_TZ', 'Europe/Helsinki');
 defined('GLOM_API_TOKEN') || define('GLOM_API_TOKEN', 'change-this-ingest-token'); // for ?api=ingest (Health pushes)
-defined('GLOM_VERSION')   || define('GLOM_VERSION', '0.2.0');                // bump to bust the PWA cache
+defined('GLOM_VERSION')   || define('GLOM_VERSION', '0.6.0');                // bump to bust the PWA cache
 
 // Optional Withings weight sync: register a (free) app at developer.withings.com,
 // set the callback URL to this app's exact URL (no query string), paste keys here.
@@ -78,12 +85,14 @@ function db(): PDO {
                 protein_per_100g REAL NOT NULL,
                 last_grams       REAL,
                 use_count        INTEGER NOT NULL DEFAULT 0,
+                favourite        INTEGER NOT NULL DEFAULT 0,
                 archived         INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS meals (
                 id        INTEGER PRIMARY KEY,
                 name      TEXT NOT NULL,
                 use_count INTEGER NOT NULL DEFAULT 0,
+                favourite INTEGER NOT NULL DEFAULT 0,
                 archived  INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS meal_items (
@@ -119,6 +128,23 @@ function db(): PDO {
         }
         // Steps tracking was removed in v0.5; shed the table from older databases.
         $pdo->exec('DROP TABLE IF EXISTS steps');
+        // Migration for v0.6: foods and meals gained a favourite flag that pins them
+        // above a divider in the pickers. Seed it once from the most-used items so the
+        // favourites section replaces the old top-8 chip strip without going empty.
+        try {
+            $pdo->exec("ALTER TABLE foods ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0");
+            $pdo->exec("UPDATE foods SET favourite = 1 WHERE id IN
+                        (SELECT id FROM foods WHERE use_count > 0 ORDER BY use_count DESC, name LIMIT 8)");
+        } catch (PDOException) {
+            // column already exists
+        }
+        try {
+            $pdo->exec("ALTER TABLE meals ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0");
+            $pdo->exec("UPDATE meals SET favourite = 1 WHERE id IN
+                        (SELECT id FROM meals WHERE use_count > 0 ORDER BY use_count DESC, name LIMIT 8)");
+        } catch (PDOException) {
+            // column already exists
+        }
     }
     return $pdo;
 }
@@ -189,6 +215,58 @@ function setting_set(string $key, ?string $value): void {
     } else {
         db()->prepare('INSERT INTO settings (key, value) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET value = excluded.value')->execute([$key, $value]);
+    }
+}
+
+/**
+ * Once a week, on the first app open of the week, snapshot the whole database
+ * into history/<date>/ as both a consistent .sqlite copy (exact restore) and a
+ * CSV per table (human-readable). Cheap safety net against an accidental wipe.
+ * Never throws, never blocks the app; returns the backup date on success, else null.
+ */
+function maybe_weekly_backup(): ?string {
+    try {
+        $todayStr = today();
+        $last = setting('last_backup');
+        if ($last !== null) {
+            $diff = (new DateTimeImmutable($todayStr))->diff(new DateTimeImmutable($last))->days;
+            if ($diff < 7) return null;
+        }
+        $dir = GLOM_HISTORY;
+        if (!is_dir($dir) && !@mkdir($dir, 0700, true)) return null;
+        if (!is_writable($dir)) return null;
+        // Belt-and-braces web denial for Apache hosts, independent of vhost config.
+        $ht = $dir . '/.htaccess';
+        if (!file_exists($ht)) @file_put_contents($ht, "Require all denied\nDeny from all\n");
+
+        $stamp = $dir . '/' . $todayStr;
+        if (!is_dir($stamp) && !@mkdir($stamp, 0700, true)) return null;
+
+        // Work on a dedicated connection: the request's shared db() has statements
+        // in progress, and VACUUM refuses to run alongside those.
+        $bdb = new PDO('sqlite:' . GLOM_DB, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+
+        // VACUUM INTO writes a clean, consistent copy that folds in the WAL; it
+        // refuses to overwrite, so clear any half-made file from a failed run.
+        $sqliteOut = $stamp . '/glom.sqlite';
+        if (file_exists($sqliteOut)) @unlink($sqliteOut);
+        $bdb->exec('VACUUM INTO ' . $bdb->quote($sqliteOut));
+
+        foreach (['foods', 'meals', 'meal_items', 'entries', 'weights', 'settings'] as $table) {
+            $cols = $bdb->query("PRAGMA table_info($table)")->fetchAll(PDO::FETCH_COLUMN, 1);
+            if (!$cols) continue;
+            $fh = @fopen($stamp . '/' . $table . '.csv', 'w');
+            if ($fh === false) continue;
+            // Explicit args: RFC-4180 quoting (empty escape) and no PHP 8.4+ deprecation notice.
+            fputcsv($fh, $cols, ',', '"', '');
+            foreach ($bdb->query("SELECT * FROM $table", PDO::FETCH_NUM) as $row) fputcsv($fh, $row, ',', '"', '');
+            fclose($fh);
+        }
+
+        setting_set('last_backup', $todayStr);
+        return $todayStr;
+    } catch (Throwable) {
+        return null; // a backup hiccup must never break the daily load
     }
 }
 
@@ -452,7 +530,7 @@ function api(string $action): never {
 
         case 'foods.list':
             $foods = db()->query(
-                'SELECT id, name, kcal_per_100g, protein_per_100g, last_grams, use_count
+                'SELECT id, name, kcal_per_100g, protein_per_100g, last_grams, use_count, favourite
                  FROM foods WHERE archived = 0 ORDER BY use_count DESC, name'
             )->fetchAll();
             json_out(['ok' => true, 'foods' => $foods]);
@@ -463,15 +541,16 @@ function api(string $action): never {
             $name    = clean_name($b['name'] ?? '');
             $kcal    = num($b['kcal_per_100g'] ?? null, 0, 20000, 'kcal per 100 g');
             $protein = num($b['protein_per_100g'] ?? null, 0, 1000, 'protein per 100 g');
+            $fav = !empty($b['favourite']) ? 1 : 0;
             $id = $b['id'] ?? null;
             if ($id !== null) {
                 $id = (int)num($id, 1, PHP_INT_MAX, 'id');
-                $st = db()->prepare('UPDATE foods SET name = ?, kcal_per_100g = ?, protein_per_100g = ? WHERE id = ? AND archived = 0');
-                $st->execute([$name, $kcal, $protein, $id]);
+                $st = db()->prepare('UPDATE foods SET name = ?, kcal_per_100g = ?, protein_per_100g = ?, favourite = ? WHERE id = ? AND archived = 0');
+                $st->execute([$name, $kcal, $protein, $fav, $id]);
                 if ($st->rowCount() === 0) fail('food not found', 404);
             } else {
-                db()->prepare('INSERT INTO foods (name, kcal_per_100g, protein_per_100g) VALUES (?, ?, ?)')
-                    ->execute([$name, $kcal, $protein]);
+                db()->prepare('INSERT INTO foods (name, kcal_per_100g, protein_per_100g, favourite) VALUES (?, ?, ?, ?)')
+                    ->execute([$name, $kcal, $protein, $fav]);
                 $id = (int)db()->lastInsertId();
             }
             json_out(['ok' => true, 'id' => $id]);
@@ -486,7 +565,7 @@ function api(string $action): never {
 
         case 'meals.list': {
             $meals = db()->query(
-                'SELECT id, name, use_count FROM meals WHERE archived = 0 ORDER BY use_count DESC, name'
+                'SELECT id, name, use_count, favourite FROM meals WHERE archived = 0 ORDER BY use_count DESC, name'
             )->fetchAll();
             $itemsStmt = db()->prepare(
                 'SELECT mi.id, mi.food_id, f.name AS food_name, f.archived AS food_archived,
@@ -507,6 +586,7 @@ function api(string $action): never {
             require_post();
             $b = body();
             $name  = clean_name($b['name'] ?? '');
+            $fav   = !empty($b['favourite']) ? 1 : 0;
             $items = $b['items'] ?? null;
             if (!is_array($items) || $items === []) fail('a meal needs at least one item');
             $parsed = [];
@@ -535,12 +615,12 @@ function api(string $action): never {
                 $id = $b['id'] ?? null;
                 if ($id !== null) {
                     $id = (int)num($id, 1, PHP_INT_MAX, 'id');
-                    $st = $db->prepare('UPDATE meals SET name = ? WHERE id = ? AND archived = 0');
-                    $st->execute([$name, $id]);
+                    $st = $db->prepare('UPDATE meals SET name = ?, favourite = ? WHERE id = ? AND archived = 0');
+                    $st->execute([$name, $fav, $id]);
                     if ($st->rowCount() === 0) fail('meal not found', 404);
                     $db->prepare('DELETE FROM meal_items WHERE meal_id = ?')->execute([$id]);
                 } else {
-                    $db->prepare('INSERT INTO meals (name) VALUES (?)')->execute([$name]);
+                    $db->prepare('INSERT INTO meals (name, favourite) VALUES (?, ?)')->execute([$name, $fav]);
                     $id = (int)$db->lastInsertId();
                 }
                 $ins = $db->prepare(
@@ -678,6 +758,7 @@ function api(string $action): never {
                 'totals' => $totals,
                 'targets' => get_targets(),
                 'withings' => withings_status(),
+                'backup' => maybe_weekly_backup(),
             ]);
         }
 
@@ -1050,7 +1131,7 @@ body {
 }
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
 input { font: inherit; color: inherit; }
-#app { max-width: 480px; margin: 0 auto; padding: 12px 16px 300px; }
+#app { max-width: 480px; margin: 0 auto; padding: 12px 16px 300px; } /* bottom pad is set live to the add-bar height by JS */
 #login { max-width: 480px; margin: 0 auto; padding: 12px 16px 40px; }
 
 /* ---------- login ---------- */
@@ -1165,33 +1246,21 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 }
 .toast.show { opacity: 1; transform: translateX(-50%); }
 
-/* ---------- favourites strip + add bar ---------- */
+/* ---------- add bar ---------- */
 #addbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
   background: var(--card); border-top: 1px solid var(--line);
   box-shadow: 0 -6px 24px rgba(34,51,43,.08);
   padding: 0 0 env(safe-area-inset-bottom);
 }
-#addbar .inner { max-width: 480px; margin: 0 auto; padding: 8px 16px 10px; }
-#chips {
-  display: flex; gap: 8px; overflow-x: auto;
-  margin: 0 -16px; padding: 2px 16px 8px; /* bleed to the screen edge so clipped pills read as scrollable */
-  scrollbar-width: none; -webkit-overflow-scrolling: touch;
-  --fadeL: 0px; --fadeR: 0px;
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 var(--fadeL), #000 calc(100% - var(--fadeR)), transparent);
-  mask-image: linear-gradient(90deg, transparent, #000 var(--fadeL), #000 calc(100% - var(--fadeR)), transparent);
+#addbar .inner { max-width: 480px; margin: 0 auto; padding: 2px 16px 10px; }
+.grabber {
+  display: block; width: 100%; padding: 8px 0 6px; color: var(--ink-soft);
+  font-size: 1rem; line-height: 1; text-align: center;
 }
-#chips.fadeL { --fadeL: 36px; }
-#chips.fadeR { --fadeR: 36px; }
-#chips::-webkit-scrollbar { display: none; }
-.chip {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
-  border: 1.5px solid var(--line); border-radius: 999px; padding: 7px 14px;
-  font-weight: 700; font-size: .95rem; background: var(--bg); white-space: nowrap;
-}
-.chip:active { transform: scale(.96); }
-.chip.meal { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
-.chip .k { color: var(--ink-soft); font-weight: 600; font-size: .85rem; }
+.grabber .chev { display: inline-block; transition: transform .2s; }
+#addbar.collapsed .grabber .chev { transform: rotate(180deg); }
+#addbar.collapsed .pane { display: none !important; }
 .tabs { display: flex; gap: 4px; background: var(--track); border-radius: 14px; padding: 4px; }
 .tabs button {
   flex: 1; padding: 8px 0; border-radius: 10px; font-weight: 700; color: var(--ink-soft);
@@ -1219,6 +1288,18 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 .pick:active, .pick.sel { background: var(--track); }
 .pick .k { margin-left: auto; color: var(--ink-soft); font-weight: 600; font-size: .9rem; white-space: nowrap; }
 .pick.zero { color: var(--ink-soft); font-weight: 600; }
+.pick .star { color: var(--green); margin-right: 2px; font-size: .8em; }
+.pickdiv {
+  display: flex; align-items: center; gap: 8px; margin: 6px 8px;
+  color: var(--ink-soft); font-size: .72rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .07em;
+}
+.pickdiv::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.favtoggle {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  font-weight: 700; font-size: .9rem; color: var(--ink-soft);
+}
+.favtoggle input { flex: 0 0 auto; width: auto; accent-color: var(--green); }
 .preview { margin-top: 8px; color: var(--ink-soft); font-weight: 700; text-align: center; min-height: 1.3em; }
 .preview b { color: var(--ink); }
 
@@ -1386,7 +1467,7 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
 
   <div id="addbar">
     <div class="inner">
-      <div id="chips"></div>
+      <button id="addbarToggle" class="grabber" type="button" aria-label="Collapse or expand the add panel"><span class="chev">&#9662;</span></button>
       <div class="tabs" role="tablist">
         <button id="tabFood" data-pane="paneFood">Food</button>
         <button id="tabMeal" data-pane="paneMeal">Meal</button>
@@ -1402,6 +1483,9 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
         <div class="picklist" id="foodList"></div>
       </div>
       <div class="pane" id="paneMeal" hidden>
+        <div class="row">
+          <input class="grow" id="mealSearch" type="search" placeholder="Search meals…" autocomplete="off">
+        </div>
         <div class="picklist" id="mealList"></div>
       </div>
       <div class="pane" id="paneQuick" hidden>
@@ -1441,6 +1525,7 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
           <input id="ffKcal" type="number" inputmode="decimal" min="0" step="0.1" placeholder="kcal / 100 g" required>
           <input id="ffProtein" type="number" inputmode="decimal" min="0" step="0.1" placeholder="protein g / 100 g" required>
         </div>
+        <label class="favtoggle"><input type="checkbox" id="ffFav"> &#9733; Favourite &middot; pin to top of the list</label>
         <div class="btnrow">
           <button class="btn-primary" type="submit" id="ffSave">Add food</button>
           <button class="btn-ghost" type="button" id="ffCancel" hidden>Cancel</button>
@@ -1459,6 +1544,7 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
         <button class="switch" type="button" id="mfAddFoodItem">+ favourite food</button>
         <button class="switch" type="button" id="mfAddRawItem">+ raw kcal / protein</button>
         <div class="total" id="mfTotal"></div>
+        <label class="favtoggle"><input type="checkbox" id="mfFav"> &#9733; Favourite &middot; pin to top of the list</label>
         <div class="btnrow">
           <button class="btn-primary" type="submit" id="mfSave">Add meal</button>
           <button class="btn-ghost" type="button" id="mfCancel" hidden>Cancel</button>
@@ -1561,6 +1647,7 @@ const App = {
     this.state.date = d.date;
     this.state.day = d;
     this.render();
+    if (d.backup) this.toast('Database backed up ✓');
     this.maybeWithingsSync();
   },
 
@@ -1800,49 +1887,13 @@ const App = {
     const [f, m] = await Promise.all([this.api('foods.list'), this.api('meals.list')]);
     this.state.foods = f.foods;
     this.state.meals = m.meals;
-    this.renderChips();
-    this.renderFoodList();
-    this.renderMealList();
+    this.renderFoodList(document.getElementById('foodSearch').value);
+    this.renderMealList(document.getElementById('mealSearch').value);
   },
 
   async addEntry(payload) {
     await this.api('entry.add', Object.assign({ day: this.state.date }, payload));
     await Promise.all([this.load(this.state.date), this.loadFavs()]);
-  },
-
-  renderChips() {
-    const chips = document.getElementById('chips');
-    chips.innerHTML = '';
-    const cands = [
-      ...this.state.meals.map(m => ({ kind: 'meal', it: m })),
-      ...this.state.foods.map(f => ({ kind: 'food', it: f })),
-    ].sort((a, b) => b.it.use_count - a.it.use_count).slice(0, 8);
-    for (const { kind, it } of cands) {
-      const c = document.createElement('button');
-      c.className = 'chip ' + kind;
-      const name = document.createElement('span');
-      name.textContent = it.name;
-      const k = document.createElement('span');
-      k.className = 'k';
-      k.textContent = kind === 'meal'
-        ? this.fmt(it.kcal) + ' kcal'
-        : this.fmt(it.last_grams ?? 100) + ' g';
-      c.append(name, k);
-      c.addEventListener('click', () => {
-        if (kind === 'meal') this.addEntry({ type: 'meal', meal_id: it.id });
-        else this.pickFood(it, true);
-      });
-      chips.appendChild(c);
-    }
-    chips.hidden = cands.length === 0;
-    this.chipFades();
-  },
-
-  chipFades() {
-    const c = document.getElementById('chips');
-    const max = c.scrollWidth - c.clientWidth;
-    c.classList.toggle('fadeL', c.scrollLeft > 4);
-    c.classList.toggle('fadeR', c.scrollLeft < max - 4);
   },
 
   pickFood(food, switchTab) {
@@ -1872,51 +1923,63 @@ const App = {
     }
   },
 
-  renderFoodList(filter) {
-    const list = document.getElementById('foodList');
+  // Shared render for both pickers: favourites float above a divider, both groups
+  // already arrive ordered by use_count (most-eaten first) from the server.
+  renderPickList(list, items, subText, onPick, isSel, emptyMsg) {
     list.innerHTML = '';
-    const q = (filter || '').trim().toLowerCase();
-    for (const f of this.state.foods.filter(f => !q || f.name.toLowerCase().includes(q))) {
+    const favs = items.filter(i => i.favourite);
+    const rest = items.filter(i => !i.favourite);
+    const add = (it, star) => {
       const b = document.createElement('button');
-      b.className = 'pick' + (this.state.selFood?.id === f.id ? ' sel' : '');
+      b.className = 'pick' + (isSel && isSel(it) ? ' sel' : '');
       const name = document.createElement('span');
-      name.textContent = f.name;
+      if (star) { const s = document.createElement('span'); s.className = 'star'; s.textContent = '★'; name.append(s); }
+      name.append(it.name);
       const k = document.createElement('span');
       k.className = 'k';
-      k.textContent = this.fmt(f.kcal_per_100g) + ' kcal · ' + this.fmt(f.protein_per_100g) + ' g / 100 g';
+      k.textContent = subText(it);
       b.append(name, k);
-      b.addEventListener('click', () => this.pickFood(f, false));
+      b.addEventListener('click', () => onPick(it));
       list.appendChild(b);
+    };
+    favs.forEach(f => add(f, true));
+    if (favs.length && rest.length) {
+      const d = document.createElement('div');
+      d.className = 'pickdiv';
+      d.textContent = 'more';
+      list.appendChild(d);
     }
-    if (!list.children.length) {
+    rest.forEach(r => add(r, false));
+    if (!favs.length && !rest.length) {
       const e = document.createElement('div');
       e.className = 'pick zero';
-      e.textContent = this.state.foods.length ? 'No match.' : 'No favourite foods yet. Add them from the book icon.';
+      e.textContent = emptyMsg;
       list.appendChild(e);
     }
   },
 
-  renderMealList() {
-    const list = document.getElementById('mealList');
-    list.innerHTML = '';
-    for (const m of this.state.meals) {
-      const b = document.createElement('button');
-      b.className = 'pick';
-      const name = document.createElement('span');
-      name.textContent = m.name;
-      const k = document.createElement('span');
-      k.className = 'k';
-      k.textContent = this.fmt(m.kcal) + ' kcal · ' + this.fmt(m.protein) + ' g';
-      b.append(name, k);
-      b.addEventListener('click', () => this.addEntry({ type: 'meal', meal_id: m.id }));
-      list.appendChild(b);
-    }
-    if (!list.children.length) {
-      const e = document.createElement('div');
-      e.className = 'pick zero';
-      e.textContent = 'No favourite meals yet. Build them from the book icon.';
-      list.appendChild(e);
-    }
+  renderFoodList(filter) {
+    const q = (filter || '').trim().toLowerCase();
+    this.renderPickList(
+      document.getElementById('foodList'),
+      this.state.foods.filter(f => !q || f.name.toLowerCase().includes(q)),
+      f => this.fmt(f.kcal_per_100g) + ' kcal · ' + this.fmt(f.protein_per_100g) + ' g / 100 g',
+      f => this.pickFood(f, false),
+      f => this.state.selFood?.id === f.id,
+      this.state.foods.length ? 'No match.' : 'No foods yet. Add them from the book icon.'
+    );
+  },
+
+  renderMealList(filter) {
+    const q = (filter || '').trim().toLowerCase();
+    this.renderPickList(
+      document.getElementById('mealList'),
+      this.state.meals.filter(m => !q || m.name.toLowerCase().includes(q)),
+      m => this.fmt(m.kcal) + ' kcal · ' + this.fmt(m.protein) + ' g',
+      m => this.addEntry({ type: 'meal', meal_id: m.id }),
+      null,
+      this.state.meals.length ? 'No match.' : 'No meals yet. Build them from the book icon.'
+    );
   },
 
   setTab(id) {
@@ -1926,6 +1989,20 @@ const App = {
       document.getElementById(t.dataset.pane).hidden = !on;
     }
     localStorage.setItem('glom_tab', id);
+  },
+
+  // Collapse the add bar down to its tab strip so it stops covering the page.
+  setAddbar(collapsed) {
+    document.getElementById('addbar').classList.toggle('collapsed', collapsed);
+    localStorage.setItem('glom_addbar', collapsed ? 'collapsed' : 'open');
+    this.syncAddbarPad();
+  },
+
+  // Reserve exactly as much bottom padding as the fixed add bar occupies, so
+  // Trends and the last entries always scroll clear of it in either state.
+  syncAddbarPad() {
+    const h = document.getElementById('addbar').offsetHeight;
+    document.getElementById('app').style.paddingBottom = (h + 16) + 'px';
   },
 
   // ---------- manager panel ----------
@@ -1957,13 +2034,14 @@ const App = {
     foods.innerHTML = '';
     for (const f of this.state.foods) {
       foods.appendChild(this.mgrItem(
-        f.name,
+        (f.favourite ? '★ ' : '') + f.name,
         this.fmt(f.kcal_per_100g) + ' kcal · ' + this.fmt(f.protein_per_100g) + ' g / 100 g',
         () => {
           document.getElementById('ffId').value = f.id;
           document.getElementById('ffName').value = f.name;
           document.getElementById('ffKcal').value = f.kcal_per_100g;
           document.getElementById('ffProtein').value = f.protein_per_100g;
+          document.getElementById('ffFav').checked = !!f.favourite;
           document.getElementById('ffSave').textContent = 'Save food';
           document.getElementById('ffCancel').hidden = false;
         },
@@ -1979,7 +2057,7 @@ const App = {
     meals.innerHTML = '';
     for (const m of this.state.meals) {
       meals.appendChild(this.mgrItem(
-        m.name,
+        (m.favourite ? '★ ' : '') + m.name,
         this.fmt(m.kcal) + ' kcal · ' + this.fmt(m.protein) + ' g',
         () => this.editMeal(m),
         async () => {
@@ -2115,6 +2193,7 @@ const App = {
   editMeal(m) {
     document.getElementById('mfId').value = m.id;
     document.getElementById('mfName').value = m.name;
+    document.getElementById('mfFav').checked = !!m.favourite;
     document.getElementById('mfItems').innerHTML = '';
     for (const it of m.items) this.mealItemRow(it.food_id ? 'food' : 'raw', it);
     document.getElementById('mfSave').textContent = 'Save meal';
@@ -2323,8 +2402,15 @@ document.addEventListener('visibilitychange', () => {
 });
 
 for (const t of document.querySelectorAll('#addbar .tabs button')) {
-  t.addEventListener('click', () => App.setTab(t.id));
+  t.addEventListener('click', () => { App.setAddbar(false); App.setTab(t.id); });
 }
+document.getElementById('addbarToggle').addEventListener('click', () => {
+  App.setAddbar(!document.getElementById('addbar').classList.contains('collapsed'));
+});
+// Keep the page's bottom padding matched to the add bar as its height changes
+// (tab switch, list length, rotation).
+new ResizeObserver(() => App.syncAddbarPad()).observe(document.getElementById('addbar'));
+window.addEventListener('resize', () => App.syncAddbarPad());
 document.getElementById('foodSearch').addEventListener('input', (e) => {
   App.state.selFood = null;
   App.renderFoodList(e.target.value);
@@ -2379,6 +2465,7 @@ document.getElementById('foodForm').addEventListener('submit', async (e) => {
     name: document.getElementById('ffName').value,
     kcal_per_100g: +document.getElementById('ffKcal').value,
     protein_per_100g: +document.getElementById('ffProtein').value,
+    favourite: document.getElementById('ffFav').checked ? 1 : 0,
   });
   App.resetFoodForm();
   await App.loadFavs();
@@ -2397,15 +2484,7 @@ scanFile.addEventListener('change', () => {
   if (scanTarget && scanFile.files.length) App.scan(scanTarget.kind, scanFile.files, scanTarget.btn);
 });
 
-const chipsEl = document.getElementById('chips');
-chipsEl.addEventListener('scroll', () => App.chipFades(), { passive: true });
-window.addEventListener('resize', () => App.chipFades());
-chipsEl.addEventListener('wheel', (e) => {
-  // mouse wheels only scroll vertically; steer that into the strip
-  if (chipsEl.scrollWidth <= chipsEl.clientWidth || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
-  chipsEl.scrollLeft += e.deltaY;
-  e.preventDefault();
-}, { passive: false });
+document.getElementById('mealSearch').addEventListener('input', (e) => App.renderMealList(e.target.value));
 
 document.getElementById('mfAddFoodItem').addEventListener('click', () => App.mealItemRow('food'));
 document.getElementById('mfAddRawItem').addEventListener('click', () => App.mealItemRow('raw'));
@@ -2418,6 +2497,7 @@ document.getElementById('mealForm').addEventListener('submit', async (e) => {
     id: id ? +id : undefined,
     name: document.getElementById('mfName').value,
     items,
+    favourite: document.getElementById('mfFav').checked ? 1 : 0,
   });
   App.resetMealForm();
   await App.loadFavs();
@@ -2458,6 +2538,7 @@ document.getElementById('dailyQuote').addEventListener('click', () => { App._quo
 document.getElementById('shareBtn').addEventListener('click', () => App.shareCard());
 
 App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
+App.setAddbar(localStorage.getItem('glom_addbar') === 'collapsed');
 App.renderQuote();
 App.load();
 App.loadFavs();

@@ -1,4 +1,5 @@
 glom.sqlite*
+history/
 .playwright-mcp/
 *.png
 docs/
