@@ -41,7 +41,7 @@ defined('GLOM_DB')        || define('GLOM_DB', __DIR__ . '/glom.sqlite');
 defined('GLOM_HISTORY')   || define('GLOM_HISTORY', __DIR__ . '/history');    // weekly DB backups land here
 defined('GLOM_TZ')        || define('GLOM_TZ', 'Europe/Helsinki');
 defined('GLOM_API_TOKEN') || define('GLOM_API_TOKEN', 'change-this-ingest-token'); // for ?api=ingest (Health pushes)
-defined('GLOM_VERSION')   || define('GLOM_VERSION', '0.6.0');                // bump to bust the PWA cache
+defined('GLOM_VERSION')   || define('GLOM_VERSION', '0.7.0');                // bump to bust the PWA cache
 
 // Optional Withings weight sync: register a (free) app at developer.withings.com,
 // set the callback URL to this app's exact URL (no query string), paste keys here.
@@ -747,14 +747,22 @@ function api(string $action): never {
             $st = $db->prepare('SELECT kg FROM weights WHERE day = ?');
             $st->execute([$date]);
             $weight = $st->fetchColumn();
-            $st = $db->prepare('SELECT kg FROM weights WHERE day < ? ORDER BY day DESC LIMIT 1');
-            $st->execute([$date]);
-            $prev = $st->fetchColumn();
+            // Rolling 3-reading averages ending at (and including) the viewed day, vs
+            // the 3 readings before those. Smooths daily noise for the header trend
+            // arrow; averages whatever is available when fewer than 3 exist.
+            $recent = $db->prepare('SELECT kg FROM weights WHERE day <= ? ORDER BY day DESC LIMIT 3');
+            $recent->execute([$date]);
+            $recentKg = $recent->fetchAll(PDO::FETCH_COLUMN);
+            $older = $db->prepare('SELECT kg FROM weights WHERE day <= ? ORDER BY day DESC LIMIT 3 OFFSET 3');
+            $older->execute([$date]);
+            $olderKg = $older->fetchAll(PDO::FETCH_COLUMN);
+            $avg = fn(array $a): ?float => $a ? array_sum($a) / count($a) : null;
             json_out([
                 'ok' => true, 'date' => $date, 'today' => today(),
                 'entries' => $entries,
                 'weight' => $weight === false ? null : (float)$weight,
-                'prev_weight' => $prev === false ? null : (float)$prev,
+                'avg3' => $avg($recentKg),
+                'prev_avg3' => $avg($olderKg),
                 'totals' => $totals,
                 'targets' => get_targets(),
                 'withings' => withings_status(),
@@ -1156,9 +1164,12 @@ input { font: inherit; color: inherit; }
 header { display: flex; align-items: center; gap: 4px; padding: 8px 0 4px; }
 header .nav { font-size: 1.5rem; padding: 6px 12px; color: var(--ink-soft); border-radius: 12px; }
 header .nav:active { background: var(--track); }
-#dateLabel { position: relative; font-size: 1.25rem; font-weight: 800; padding: 6px 4px; }
+#dateLabel { position: relative; font-size: 1.25rem; font-weight: 800; padding: 6px 4px; cursor: pointer; }
+/* A 1px anchor for the native picker popover, not a full overlay: on iOS a date
+   input keeps a native min tap-area that used to bleed over the next-day arrow. */
 #dateLabel input {
-  position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%;
+  position: absolute; left: 8px; bottom: 0; width: 1px; height: 1px;
+  opacity: 0; pointer-events: none; border: 0; padding: 0;
 }
 header .spacer { flex: 1; }
 header .iconbtn { padding: 8px; border-radius: 12px; color: var(--ink-soft); }
@@ -1366,6 +1377,12 @@ header .iconbtn svg { width: 22px; height: 22px; display: block; }
 }
 #trendsToggle .arr { display: inline-block; transition: transform .2s; }
 #trendsToggle.open .arr { transform: rotate(90deg); }
+.trange { display: flex; gap: 6px; margin: 2px 0 10px; }
+.trange button {
+  padding: 5px 14px; border-radius: 999px; font-size: .8rem; font-weight: 700;
+  color: var(--ink-soft); border: 1.5px solid var(--line); background: var(--card);
+}
+.trange button.on { background: var(--green); color: #fff; border-color: var(--green); }
 .tpanel {
   background: var(--card); border: 1px solid var(--line); border-radius: 16px;
   padding: 12px 14px 8px; margin-bottom: 8px; box-shadow: var(--shadow);
@@ -1455,8 +1472,12 @@ document.getElementById('pinform').addEventListener('submit', async (e) => {
   </section>
 
   <section id="trends">
-    <button id="trendsToggle"><span class="arr">&#9656;</span> Trends · last 30 days</button>
+    <button id="trendsToggle"><span class="arr">&#9656;</span> Trends</button>
     <div id="trendsBody" hidden>
+      <div class="trange" role="group" aria-label="Trend range">
+        <button type="button" data-days="7">7 days</button>
+        <button type="button" data-days="30">30 days</button>
+      </div>
       <div class="tpanel"><h3>weight · kg</h3><div class="cwrap"><canvas id="chWeight"></canvas></div></div>
       <div class="tpanel"><h3>kcal vs target</h3><div class="cwrap"><canvas id="chKcal"></canvas></div></div>
       <div class="tpanel"><h3>protein · g vs target</h3><div class="cwrap"><canvas id="chProtein"></canvas></div></div>
@@ -1795,11 +1816,13 @@ const App = {
 
     el('weightIn').value = day.weight ?? '';
     const delta = el('weightDelta');
-    if (day.weight != null && day.prev_weight != null) {
-      const diff = day.weight - day.prev_weight;
+    // 3-day rolling average vs the previous 3, so day-to-day water weight doesn't shout.
+    if (day.avg3 != null && day.prev_avg3 != null) {
+      const diff = day.avg3 - day.prev_avg3;
       delta.textContent = (diff <= 0 ? '▾ ' : '▴ ') + Math.abs(diff).toFixed(1);
       delta.className = 'delta ' + (diff <= 0 ? 'good' : 'warn'); // losing weight reads green
-    } else { delta.textContent = ''; delta.className = 'delta'; }
+      delta.title = '3-day average vs the 3 readings before';
+    } else { delta.textContent = ''; delta.className = 'delta'; delta.removeAttribute('title'); }
 
     el('wSync').hidden = day.withings !== 'connected';
 
@@ -2293,10 +2316,20 @@ const App = {
       }).catch(() => this.toast('could not load charts'));
       if (!window.Chart) return;
     }
-    const d = await this.api('trend&days=30&end=' + this.todayLocal());
+    const d = await this.api('trend&days=' + this.state.trendDays + '&end=' + this.todayLocal());
     this.renderTrends(d);
     body.hidden = false;
     btn.classList.add('open');
+  },
+
+  async setTrendRange(n) {
+    this.state.trendDays = n;
+    localStorage.setItem('glom_trenddays', n);
+    for (const b of document.querySelectorAll('.trange button')) b.classList.toggle('on', +b.dataset.days === n);
+    if (!document.getElementById('trendsBody').hidden) {
+      const d = await this.api('trend&days=' + n + '&end=' + this.todayLocal());
+      this.renderTrends(d);
+    }
   },
 
   renderTrends({ days, targets }) {
@@ -2373,6 +2406,11 @@ const App = {
 
 document.getElementById('prevDay').addEventListener('click', () => App.shiftDay(-1));
 document.getElementById('nextDay').addEventListener('click', () => App.shiftDay(1));
+document.getElementById('dateLabel').addEventListener('click', () => {
+  const dp = document.getElementById('datePick');
+  if (dp.showPicker) { try { dp.showPicker(); return; } catch {} }
+  dp.focus(); dp.click(); // older browsers without showPicker()
+});
 document.getElementById('datePick').addEventListener('change', (e) => App.load(e.target.value));
 document.getElementById('weightIn').addEventListener('change', async (e) => {
   if (e.target.validity.badInput) return; // rejected keystrokes read as '', which would delete the weight
@@ -2439,6 +2477,9 @@ document.getElementById('quickAdd').addEventListener('click', async () => {
 });
 
 document.getElementById('trendsToggle').addEventListener('click', () => App.toggleTrends());
+for (const b of document.querySelectorAll('.trange button')) {
+  b.addEventListener('click', () => App.setTrendRange(+b.dataset.days));
+}
 document.getElementById('openBook').addEventListener('click', () => App.openPanel('bookPanel'));
 document.getElementById('openGear').addEventListener('click', () => App.openPanel('gearPanel'));
 document.getElementById('overlay').addEventListener('click', () => App.closePanels());
@@ -2539,6 +2580,8 @@ document.getElementById('shareBtn').addEventListener('click', () => App.shareCar
 
 App.setTab(['tabFood', 'tabMeal', 'tabQuick'].includes(localStorage.getItem('glom_tab')) ? localStorage.getItem('glom_tab') : 'tabFood');
 App.setAddbar(localStorage.getItem('glom_addbar') === 'collapsed');
+App.state.trendDays = [7, 30].includes(+localStorage.getItem('glom_trenddays')) ? +localStorage.getItem('glom_trenddays') : 30;
+for (const b of document.querySelectorAll('.trange button')) b.classList.toggle('on', +b.dataset.days === App.state.trendDays);
 App.renderQuote();
 App.load();
 App.loadFavs();
